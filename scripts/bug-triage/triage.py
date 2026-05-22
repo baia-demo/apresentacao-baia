@@ -232,51 +232,66 @@ def _resume_for_json(session_id: str) -> str:
     return ""
 
 
+def _try_parse(response_text: str) -> dict | None:
+    """Tenta extrair e validar o JSON do output. Retorna o dict ou None."""
+    json_str = _extract_json(response_text)
+    if not json_str:
+        return None
+    try:
+        parsed = json.loads(json_str)
+    except json.JSONDecodeError:
+        return None
+
+    required = ["is_bug", "confidence", "target_repo", "summary", "user_reply"]
+    if not all(k in parsed for k in required):
+        return None
+
+    raw_repo = parsed.get("target_repo")
+    if raw_repo:
+        normalized = str(raw_repo).strip().lower().split("/")[-1]
+        if normalized in TARGET_REPOS:
+            parsed["target_repo"] = normalized
+        elif raw_repo not in TARGET_REPOS:
+            log.warning(
+                "target_repo inválido '%s', fallback: %s",
+                raw_repo,
+                TARGET_REPOS[0],
+            )
+            parsed["target_repo"] = TARGET_REPOS[0]
+    return parsed
+
+
 def _parse_claude_output(raw_output: str, title: str) -> dict:
+    session_id = ""
+    subtype = ""
     try:
         outer = json.loads(raw_output)
         subtype = outer.get("subtype", "")
+        session_id = outer.get("session_id", "")
         response_text = outer.get("result", "")
-
-        if not response_text and subtype == "error_max_turns":
-            session_id = outer.get("session_id", "")
-            if session_id:
-                log.info("Max turns atingido. Resumindo sessão...")
-                response_text = _resume_for_json(session_id)
-
-        if not response_text:
-            log.warning("Claude retornou sem 'result' (subtype=%s)", subtype)
-            return _fallback_result(
-                title,
-                f"Claude Code não retornou resultado (subtype={subtype}).",
-            )
     except (json.JSONDecodeError, TypeError):
         response_text = raw_output
 
-    json_str = _extract_json(response_text)
-    if json_str:
-        try:
-            parsed = json.loads(json_str)
-            required = ["is_bug", "confidence", "target_repo", "summary", "user_reply"]
-            if all(k in parsed for k in required):
-                raw_repo = parsed.get("target_repo")
-                if raw_repo:
-                    normalized = str(raw_repo).strip().lower().split("/")[-1]
-                    if normalized in TARGET_REPOS:
-                        parsed["target_repo"] = normalized
-                    elif raw_repo not in TARGET_REPOS:
-                        log.warning(
-                            "target_repo inválido '%s', fallback: %s",
-                            raw_repo,
-                            TARGET_REPOS[0],
-                        )
-                        parsed["target_repo"] = TARGET_REPOS[0]
-                return parsed
-        except json.JSONDecodeError:
-            pass
+    parsed = _try_parse(response_text) if response_text else None
+    if parsed:
+        return parsed
 
-    log.warning("Não foi possível parsear output. preview: %s", response_text[:500])
-    return _fallback_result(title, f"Análise inconclusiva: {response_text[:500]}")
+    # Primeira tentativa falhou — tenta resumir a sessão pedindo só o JSON.
+    # Cobre tanto max_turns (sem result) quanto JSON malformado/cortado.
+    if session_id:
+        log.info(
+            "Parse falhou (subtype=%s, len=%d). Resumindo sessão para JSON limpo...",
+            subtype,
+            len(response_text or ""),
+        )
+        resumed = _resume_for_json(session_id)
+        parsed = _try_parse(resumed) if resumed else None
+        if parsed:
+            return parsed
+        log.warning("Resume também não retornou JSON válido. preview: %s", (resumed or "")[:300])
+
+    log.warning("Não foi possível parsear output. preview: %s", (response_text or "")[:500])
+    return _fallback_result(title, f"Análise inconclusiva: {(response_text or '')[:500]}")
 
 
 def _extract_json(text: str) -> str | None:

@@ -33,10 +33,22 @@ NÃO explore mais de 1 repo. NÃO leia arquivos genéricos
 
 ## Resposta
 
-OBRIGATÓRIO: sua última mensagem DEVE ser APENAS o JSON abaixo
-(sem markdown, sem crases):
+OBRIGATÓRIO. Sua mensagem final deve seguir TODAS as regras abaixo:
+
+1. O **primeiro caractere** da mensagem precisa ser `{` (chave de abertura)
+2. O **último caractere** precisa ser `}` (chave de fechamento)
+3. **Nenhum texto** antes do `{` ou depois do `}` — nem explicação, nem
+   "Achei o bug:", nem crases, nem markdown
+4. JSON precisa ser **válido e completo** (sem aspas faltando, sem campos
+   cortados no meio)
+
+Schema obrigatório (todos os campos):
 
 {"is_bug": true, "confidence": 0.85, "target_repo": "orders-api", "files_analyzed": ["src/services/totalCalculator.ts"], "summary": "Resumo em português", "explanation": "Explicação técnica em português", "suggested_fix": "Sugestão concreta ou null", "user_reply": "Mensagem amigável pra postar como comentário na issue original"}
+
+Se você estiver perto de estourar os turnos, **PARE de ler arquivos** e
+emita o JSON com o que já sabe. JSON parcial/cortado é pior que JSON com
+confiança baixa.
 
 Valores válidos de `target_repo`:
 `catalog-api`, `orders-api`, `storefront-web`.
