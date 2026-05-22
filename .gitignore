@@ -8,3 +8,6 @@ venv/
 .idea/
 .vscode/
 repos/
+slides/node_modules/
+slides/dist/
+slides/.slidev/
