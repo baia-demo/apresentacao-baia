@@ -48,8 +48,8 @@ jobs:
       - name: Instalar Claude Code CLI
         run: npm install -g @anthropic-ai/claude-code
 
-      - name: Instalar MCP Python SDK
-        run: pip install mcp
+      - name: Instalar MCP + Anthropic Python SDK
+        run: pip install mcp anthropic
 
       - name: Clonar repositórios-alvo (shallow)
         run: |

@@ -33,6 +33,11 @@ import urllib.error
 import urllib.parse
 from pathlib import Path
 
+try:
+    from anthropic import Anthropic
+except ImportError:
+    Anthropic = None  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -66,7 +71,12 @@ MCP_CONFIG_FILE = Path("/tmp/triage_mcp_config.json")
 REPOS_DIR = Path("repos")
 CLAUDE_TIMEOUT = 480
 CLAUDE_FIX_TIMEOUT = 600
-DEDUP_TIMEOUT = 180
+DEDUP_TIMEOUT = 60
+DEDUP_MODEL = "claude-haiku-4-5"
+
+# Preços por 1M tokens (Haiku 4.5)
+HAIKU_INPUT_PER_MTOK = 1.0
+HAIKU_OUTPUT_PER_MTOK = 5.0
 
 UNDEFINED_CONFIDENCE_THRESHOLD = 0.5
 REJECTION_CONFIDENCE_THRESHOLD = 0.7
@@ -286,6 +296,20 @@ def close_issue(repo: str, number: int, reason: str = "completed") -> None:
 # ---------------------------------------------------------------------------
 
 
+_anthropic_client: Anthropic | None = None
+
+
+def _anthropic() -> Anthropic | None:
+    """Lazy singleton do client Anthropic. Retorna None se SDK não instalado."""
+    global _anthropic_client
+    if _anthropic_client is None and Anthropic is not None:
+        _anthropic_client = Anthropic(
+            api_key=ANTHROPIC_API_KEY,
+            timeout=DEDUP_TIMEOUT,
+        )
+    return _anthropic_client
+
+
 def find_duplicate_issue(
     target_repo: str,
     summary: str,
@@ -294,6 +318,9 @@ def find_duplicate_issue(
 ) -> dict | None:
     """Verifica se o novo finding duplica alguma issue auto-triage aberta no target_repo.
 
+    Usa Anthropic SDK direto (não Claude Code CLI subprocess) — muito mais
+    rápido pra prompts simples como este.
+
     Retorna a issue dict (dict do GitHub) ou None.
     """
     candidates = list_open_issues_with_label(
@@ -301,6 +328,11 @@ def find_duplicate_issue(
     )
     if not candidates:
         log.info("Dedup [%s]: nenhuma issue auto-triage aberta — skip", target_repo)
+        return None
+
+    client = _anthropic()
+    if client is None:
+        log.warning("Dedup: SDK Anthropic não disponível — skip (pip install anthropic)")
         return None
 
     log.info(
@@ -334,38 +366,43 @@ Seja conservador: só marque como duplicata se tiver certeza que a causa raiz é
 Não explique. Só o número ou "none".
 """
 
+    started = time.time()
     try:
-        result = subprocess.run(
-            [
-                "claude",
-                "-p", prompt,
-                "--output-format", "json",
-                "--max-turns", "1",
-                "--model", "claude-haiku-4-5",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=DEDUP_TIMEOUT,
-            env={**os.environ, "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY},
+        response = client.messages.create(
+            model=DEDUP_MODEL,
+            max_tokens=20,
+            messages=[{"role": "user", "content": prompt}],
         )
-    except subprocess.TimeoutExpired:
-        log.warning("Dedup timeout — não consegui checar duplicatas")
+    except Exception as e:
+        log.warning("Dedup falhou (%s) — assumindo sem duplicata", e)
         return None
 
-    if result.returncode != 0:
-        log.warning("Dedup rc=%d stderr: %s", result.returncode, result.stderr[:200])
-        return None
+    duration_s = time.time() - started
+    input_tokens = response.usage.input_tokens
+    output_tokens = response.usage.output_tokens
+    cost = (
+        input_tokens * HAIKU_INPUT_PER_MTOK
+        + output_tokens * HAIKU_OUTPUT_PER_MTOK
+    ) / 1_000_000
 
-    try:
-        outer = json.loads(result.stdout)
-        accumulate(metrics, "dedup", outer)
-        response_text = (outer.get("result") or "").strip().lower()
-    except (json.JSONDecodeError, TypeError):
-        log.warning("Dedup output não-JSON: %s", result.stdout[:200])
-        return None
+    metrics["cost_usd"] += cost
+    metrics["turns"] += 1
+    metrics["duration_s"] += duration_s
+    metrics["calls"] += 1
+    log.info(
+        "Métrica [dedup]: 1 turn, %.1fs, $%.4f (in=%d out=%d tok) (acumulado: $%.4f em %d call(s))",
+        duration_s, cost, input_tokens, output_tokens,
+        metrics["cost_usd"], metrics["calls"],
+    )
+
+    response_text = ""
+    if response.content:
+        block = response.content[0]
+        if hasattr(block, "text"):
+            response_text = block.text.strip().lower()
 
     if not response_text or "none" in response_text:
-        log.info("Dedup [%s]: sem duplicata", target_repo)
+        log.info("Dedup [%s]: sem duplicata (resposta='%s')", target_repo, response_text[:50])
         return None
 
     match = re.search(r"\b(\d+)\b", response_text)
