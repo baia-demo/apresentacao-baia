@@ -367,14 +367,29 @@ Não explique. Só o número ou "none".
 """
 
     started = time.time()
-    try:
-        response = client.messages.create(
-            model=DEDUP_MODEL,
-            max_tokens=20,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except Exception as e:
-        log.warning("Dedup falhou (%s) — assumindo sem duplicata", e)
+    response = None
+    backoffs = [3, 8, 20]
+    for attempt, wait_s in enumerate(backoffs, start=1):
+        try:
+            response = client.messages.create(
+                model=DEDUP_MODEL,
+                max_tokens=20,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            break
+        except Exception as e:
+            is_overloaded = "overloaded" in str(e).lower() or "529" in str(e)
+            last = attempt == len(backoffs)
+            if is_overloaded and not last:
+                log.warning(
+                    "Dedup tentativa %d/%d falhou (overloaded). Retry em %ds...",
+                    attempt, len(backoffs), wait_s,
+                )
+                time.sleep(wait_s)
+                continue
+            log.warning("Dedup falhou (%s) — assumindo sem duplicata", e)
+            return None
+    if response is None:
         return None
 
     duration_s = time.time() - started
