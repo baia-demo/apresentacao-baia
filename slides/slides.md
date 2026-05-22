@@ -12,6 +12,10 @@ transition: slide-left
 mdc: true
 fonts:
   mono: 'JetBrains Mono'
+selectable: false
+download: false
+record: false
+contextMenu: false
 ---
 
 # Triagem Autônoma de Bugs com **Claude Code Headless**
