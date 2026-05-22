@@ -2,10 +2,12 @@
 MCP server local com a tool `submit_triage`.
 
 Spawnado como subprocesso do Claude Code (stdio MCP). Expõe uma única tool
-que aceita uma LISTA de findings — porque um report do usuário pode citar
-1+ bugs distintos, e cada um gera uma issue técnica separada no repo certo.
+que aceita uma LISTA de findings. Cada finding tem um `kind` que classifica
+o report (bug / improvement / question / unclear) — porque "is_bug" não
+cobre o caso real onde o usuário manda sugestão ou dúvida e o agente acaba
+forçando como bug (confirmation bias).
 
-Configurado via env vars passadas pelo orchestrator (triage.py):
+Configurado via env vars:
 - VALID_REPOS: lista comma-separated dos repos-alvo válidos
 - TRIAGE_OUTPUT_FILE: caminho onde gravar o JSON do veredito
 """
@@ -13,7 +15,7 @@ Configurado via env vars passadas pelo orchestrator (triage.py):
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
@@ -23,72 +25,97 @@ VALID_REPOS = [
 ]
 OUTPUT_FILE = Path(os.environ.get("TRIAGE_OUTPUT_FILE", "/tmp/triage_result.json"))
 
+FindingKind = Literal["bug", "improvement", "question", "unclear"]
+
 mcp = FastMCP("triage")
 
 
-class BugFinding(BaseModel):
-    """Um bug específico identificado dentro de um report.
+class Finding(BaseModel):
+    """Um ponto distinto identificado num report. Pode ser bug, sugestão de
+    melhoria, dúvida ou item não-classificável.
 
-    Para reports com 1 bug, use uma lista de 1 elemento.
-    Para reports com múltiplos bugs distintos (ex: 'busca não funciona E
-    o total tá errado'), use 1 elemento por bug.
+    Para reports com 1 ponto, use lista de 1 elemento.
+    Para reports compostos ("o X tá quebrado E o Y poderia ter Z"), use 1
+    elemento por ponto.
     """
 
-    is_bug: bool = Field(
-        description="True se for bug real; False se uso incorreto/comportamento esperado."
+    kind: FindingKind = Field(
+        description=(
+            "Tipo do report: "
+            "'bug' (defeito real no código); "
+            "'improvement' (sugestão de feature/UX, comportamento atual está OK); "
+            "'question' (usuário fazendo pergunta, sem reportar problema); "
+            "'unclear' (não dá pra entender o que ele quer dizer)."
+        )
     )
     confidence: float = Field(
         ge=0.0,
         le=1.0,
-        description="Confiança 0..1. Use < 0.5 quando estiver em dúvida.",
+        description="Confiança 0..1. < 0.5 = inconclusivo (não cria issue técnica).",
     )
     target_repo: Optional[str] = Field(
-        description="Nome do repo dono (sem org). null se is_bug=False."
+        description=(
+            "Repo onde a correção/feature mora. "
+            "Obrigatório se kind='bug' ou 'improvement'. "
+            "null se kind='question' ou 'unclear'."
+        )
     )
     files_analyzed: list[str] = Field(
         default_factory=list,
-        description="Paths relativos ao repo dos arquivos relevantes.",
+        description="Paths relativos ao repo (vazio se não investigou código).",
     )
     summary: str = Field(description="Resumo curto em português (1 linha).")
     explanation: str = Field(description="Explicação técnica em português.")
     suggested_fix: Optional[str] = Field(
-        description="Sugestão concreta de correção, ou null."
+        description="Sugestão concreta de fix (bug) ou de implementação (improvement). null se question/unclear."
     )
 
 
 @mcp.tool()
 def submit_triage(
-    findings: list[BugFinding],
+    findings: list[Finding],
     user_reply: str,
 ) -> str:
     """Submete o veredito final da triagem. Chame UMA VEZ no fim da análise.
 
+    Cada `finding` na lista representa um ponto distinto identificado no
+    report do usuário. Para a maioria dos reports (1 ponto), use lista de
+    1 elemento.
+
     Args:
-        findings: Lista de bugs identificados.
-            - Report com 1 bug: lista de 1 elemento.
-            - Report com N bugs distintos: lista de N elementos.
-            - Report que não é bug: lista de 1 elemento com is_bug=False.
-            - Não consegue analisar: lista de 1 elemento com is_bug=False,
-              confidence=0.0, target_repo=None, summary explicando.
-        user_reply: Comentário único pra postar na issue original do reportador.
-            Quando houver múltiplos findings, mencione todos resumidamente.
-            Tom acessível pra não-engenheiro, 2-5 linhas, pode usar markdown.
+        findings: Lista de pontos identificados.
+            - Report claro de 1 bug → 1 finding kind='bug'.
+            - Sugestão de melhoria → 1 finding kind='improvement'.
+            - Report misto ("X quebrado E Y poderia melhorar") → 2 findings.
+            - Pergunta → kind='question'.
+            - Não dá pra entender → kind='unclear', confidence=0.0.
+        user_reply: Comentário ÚNICO consolidado pra postar como resposta na
+            issue original do usuário. Quando houver múltiplos findings,
+            cubra todos resumidamente. Tom acessível, 2-5 linhas, markdown OK.
     """
     if not findings:
         raise ValueError(
-            "findings não pode ser vazia. Use ao menos 1 elemento "
-            "(com is_bug=False se a análise foi inconclusiva)."
+            "findings não pode ser vazia. Use pelo menos 1 elemento "
+            "(com kind='unclear' se a análise foi inconclusiva)."
         )
 
     for i, f in enumerate(findings):
-        if f.is_bug and not f.target_repo:
+        if f.kind in ("bug", "improvement") and not f.target_repo:
             raise ValueError(
-                f"findings[{i}]: is_bug=True requer target_repo definido."
+                f"findings[{i}]: kind='{f.kind}' requer target_repo definido."
+            )
+        if (
+            f.kind in ("question", "unclear")
+            and f.target_repo
+        ):
+            raise ValueError(
+                f"findings[{i}]: kind='{f.kind}' não deve ter target_repo. "
+                "Esses tipos não geram issue técnica."
             )
         if f.target_repo and VALID_REPOS and f.target_repo not in VALID_REPOS:
             raise ValueError(
                 f"findings[{i}]: target_repo '{f.target_repo}' inválido. "
-                f"Use um destes: {', '.join(VALID_REPOS)}"
+                f"Use: {', '.join(VALID_REPOS)}"
             )
 
     result = {
@@ -99,8 +126,9 @@ def submit_triage(
     OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_FILE.write_text(json.dumps(result, ensure_ascii=False, indent=2))
 
+    kinds_summary = ", ".join(f.kind for f in findings)
     return (
-        f"Triagem submetida ({len(findings)} finding(s)). "
+        f"Triagem submetida ({len(findings)} finding(s): {kinds_summary}). "
         "Pode encerrar — não chame essa tool de novo."
     )
 
