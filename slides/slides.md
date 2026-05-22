@@ -13,7 +13,7 @@ mdc: true
 fonts:
   sans: 'Inter'
   serif: 'Inter'
-  mono: 'JetBrains Mono'
+  mono: 'Consolas'
   fallbacks: false
 selectable: false
 download: false
@@ -39,33 +39,37 @@ como um agente faz isso em ~4 minutos, por $0.40."
 -->
 
 ---
-layout: center
-class: text-center
+layout: two-cols
 ---
+
+<img src="/douglas.jpg" class="w-64 h-auto rounded-2xl shadow-lg" />
+
+::right::
 
 # Douglas Wiliam
 
-**Engineering Manager @ Konsi** — fintech de crédito consignado
+**Engineering Manager @ Konsi**
+<div class="text-sm opacity-70">fintech de crédito consignado</div>
 
-<div class="pt-6 text-base opacity-90 max-w-2xl mx-auto leading-relaxed">
+<div class="pt-4 text-sm leading-relaxed">
 
-Lidero 2 squads cross-functional (~7 pessoas) na Konsi e toco a estratégia
-de **observabilidade** da empresa (OKR de engenharia). Antes disso, fui o
-**founding backend engineer do projeto Konsi** — então o multi-repo .NET
-que vou citar como caso de produção, **eu construí**.
+Lidero 2 squads cross-functional (~7 pessoas) e toco a estratégia de
+**observabilidade** da Konsi (OKR de engenharia). Antes disso, fui o
+**founding backend engineer do projeto Konsi** — o multi-repo .NET que
+cito como caso de produção, **eu construí**.
 
 </div>
 
-<div class="pt-6 text-sm opacity-70 max-w-2xl mx-auto">
+<div class="pt-4 text-xs opacity-60 leading-relaxed">
 
 Linux desde os 12 anos · co-fundei 2 empresas juniores na faculdade ·
 Stack atual: .NET (C#), Python, AWS, RabbitMQ · SRE/observabilidade
 
 </div>
 
-<div class="pt-8 text-sm">
+<div class="pt-4 text-sm">
 
-<a href="https://github.com/douglas-wiliam" class="text-[#0A9F82]">github.com/douglas-wiliam</a>
+<a href="https://github.com/douglas-wiliam">github.com/douglas-wiliam</a>
 
 </div>
 

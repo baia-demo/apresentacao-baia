@@ -1,23 +1,128 @@
-/* Slidev custom styles — BaIA talk */
+/* Slidev custom styles — BaIA talk
+   Identidade visual extraída do PPTX da Konsi:
+   - Fundo: #141514 (quase preto)
+   - Texto principal: #FFFFFF
+   - Texto secundário: #CECFCD / #7C7C7C
+   - Accent: #0A9F82 (verde teal) + #0DC7A2 (claro)
+   - Cards / verdes escuros: #04513F / #03261F
+   - Fontes: Inter (sans) + Consolas (mono)
+*/
 
 :root {
   --slidev-theme-primary: #0A9F82;
   --slidev-theme-accent: #0A9F82;
+  --bg-main: #141514;
+  --bg-card: #03261F;
+  --bg-card-soft: #04513F;
+  --text-main: #FFFFFF;
+  --text-soft: #CECFCD;
+  --text-muted: #7C7C7C;
+  --accent: #0A9F82;
+  --accent-light: #0DC7A2;
 }
 
-/* Links no theme default ganham cor accent */
+/* Fundo global escuro */
+body,
+.slidev-layout,
+.slidev-layout.default,
+.slidev-layout.cover,
+.slidev-layout.center,
+.slidev-layout.section,
+.slidev-layout.two-cols,
+.slidev-layout.image-right,
+.slidev-layout.image-left {
+  background: var(--bg-main) !important;
+  color: var(--text-main);
+}
+
+/* Headings em branco */
+.slidev-layout h1,
+.slidev-layout h2,
+.slidev-layout h3,
+.slidev-layout h4 {
+  color: var(--text-main);
+}
+
+/* H1 grande com accent sutil */
+.slidev-layout h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+/* Links */
 a {
-  color: #0A9F82;
+  color: var(--accent-light);
+  text-decoration: none;
+  border-bottom: 1px solid var(--accent);
+  transition: color 0.15s;
+}
+a:hover {
+  color: var(--accent);
 }
 
-/* Tabelas com header em accent */
+/* Strong/bold em accent */
+.slidev-layout strong {
+  color: var(--accent-light);
+  font-weight: 600;
+}
+
+/* Tabelas: header com accent + linhas com borda sutil */
+.slidev-layout table {
+  border-collapse: collapse;
+}
 .slidev-layout table th {
-  border-bottom: 2px solid #0A9F82;
+  color: var(--accent-light);
+  border-bottom: 2px solid var(--accent);
+  text-align: left;
+  padding: 0.4em 0.6em;
+}
+.slidev-layout table td {
+  color: var(--text-soft);
+  border-bottom: 1px solid rgba(206, 207, 205, 0.1);
+  padding: 0.4em 0.6em;
 }
 
-/* Blockquote com barra lateral accent (usado nos quotes) */
+/* Blockquotes: barra accent + texto claro */
 .slidev-layout blockquote {
-  border-left: 4px solid #0A9F82;
+  border-left: 4px solid var(--accent);
+  background: rgba(10, 159, 130, 0.08);
+  padding: 0.6em 1em;
+  color: var(--text-soft);
+  margin: 1em 0;
+}
+
+/* Code inline */
+.slidev-layout :not(pre) > code {
+  background: var(--bg-card);
+  color: var(--accent-light);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+
+/* Code blocks */
+.slidev-layout pre {
+  background: var(--bg-card) !important;
+  border: 1px solid rgba(10, 159, 130, 0.2);
+  border-radius: 8px;
+}
+
+/* Listas com bullets accent */
+.slidev-layout ul > li::marker {
+  color: var(--accent);
+}
+
+/* Slide "section" (divisores) */
+.slidev-layout.section {
+  background: linear-gradient(135deg, var(--bg-main) 0%, var(--bg-card) 100%) !important;
+}
+.slidev-layout.section h1 {
+  color: var(--accent-light);
+}
+
+/* Cover slide */
+.slidev-layout.cover {
+  background: linear-gradient(135deg, var(--bg-main) 0%, var(--bg-card) 100%) !important;
 }
 
 /* Esconde TODA a navegação/controles do Slidev */
@@ -33,7 +138,6 @@ a {
   display: none !important;
 }
 
-/* Esconde qualquer barra/container fixado no bottom da janela */
 body > .fixed.bottom-0,
 body > div > .fixed.bottom-0,
 .slidev-controls-wrapper {
