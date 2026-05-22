@@ -1,5 +1,5 @@
 ---
-theme: seriph
+theme: default
 title: Triagem Autônoma com Claude Code Headless
 info: |
   Palestra BaIA · 2026
@@ -11,7 +11,10 @@ drawings:
 transition: slide-left
 mdc: true
 fonts:
+  sans: 'Inter'
+  serif: 'Inter'
   mono: 'JetBrains Mono'
+  fallbacks: false
 selectable: false
 download: false
 record: false
@@ -62,7 +65,7 @@ Stack atual: .NET (C#), Python, AWS, RabbitMQ · SRE/observabilidade
 
 <div class="pt-8 text-sm">
 
-<a href="https://github.com/douglas-wiliam" class="text-amber-400">github.com/douglas-wiliam</a>
+<a href="https://github.com/douglas-wiliam" class="text-[#0A9F82]">github.com/douglas-wiliam</a>
 
 </div>
 
@@ -97,7 +100,7 @@ layout: section
 
 </v-clicks>
 
-<div v-click class="pt-6 text-amber-400">
+<div v-click class="pt-6 text-[#0A9F82]">
 
 **E se um agente de IA fizesse isso sozinho?**
 
@@ -140,28 +143,6 @@ image: /screenshots/shopflow-home.png
 Mostrar a tela do storefront.
 "Isso aqui tá rodando agora em shopflow-storefront.fly.dev.
 Vocês podem reportar bugs ao vivo durante a palestra."
--->
-
----
-
-# Os 6 bugs plantados (intencionais)
-
-| # | Repo | Bug |
-|---|---|---|
-| 1 | catalog-api | Busca sem acento volta vazio |
-| 2 | orders-api | Frete grátis com condição invertida |
-| 3 | orders-api | `GET /orders` zera todos os totais |
-| 4 | storefront-web | "Adicionar" não soma quantidade |
-| 5 | storefront-web | Duplo-clique no checkout duplica pedido |
-| 6 | storefront-web | "Remover" do carrinho remove os outros |
-
-<div class="pt-6 text-sm opacity-70">
-Todos com cobertura de tests verde. <strong>Tests passam, bugs estão lá.</strong>
-</div>
-
-<!--
-Cada um é um cenário diferente: classificação, navegação cross-repo,
-diagnóstico de causa raiz. Não são bugs "didáticos" óbvios — são plausíveis.
 -->
 
 ---
@@ -356,7 +337,7 @@ def submit_triage(
 
 </div>
 
-<div v-click class="pt-6 text-xl text-amber-400">
+<div v-click class="pt-6 text-xl text-[#0A9F82]">
 
 > Output estruturado de LLM não vem do prompt. Vem do schema da tool.
 
@@ -478,7 +459,7 @@ test("encontra produto quando termo JÁ TEM acento", () => {
 
 </v-click>
 
-<div v-click class="pt-6 text-xl text-amber-400">
+<div v-click class="pt-6 text-xl text-[#0A9F82]">
 
 > Tests passando ≠ cliente feliz. O agente é a rede que pega o que tests não pegam.
 
@@ -765,7 +746,7 @@ layout: section
 
 </v-clicks>
 
-<div v-click class="pt-6 text-amber-400">
+<div v-click class="pt-6 text-[#0A9F82]">
 
 **Risco maior controlado:** preview deploy + smoke detecta a maioria das regressões antes do merge. Se passar nessa peneira, vai pra prod.
 
@@ -830,8 +811,8 @@ class: text-center
 
 <div class="text-xl pt-6">
 
-Código: <a href="https://github.com/baia-demo" class="text-amber-400">github.com/baia-demo</a><br/>
-Live demo: <a href="https://shopflow-storefront.fly.dev" class="text-amber-400">shopflow-storefront.fly.dev</a>
+Código: <a href="https://github.com/baia-demo" class="text-[#0A9F82]">github.com/baia-demo</a><br/>
+Live demo: <a href="https://shopflow-storefront.fly.dev" class="text-[#0A9F82]">shopflow-storefront.fly.dev</a>
 
 </div>
 

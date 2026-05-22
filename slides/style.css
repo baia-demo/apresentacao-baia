@@ -1,0 +1,21 @@
+/* Slidev custom styles — BaIA talk */
+
+:root {
+  --slidev-theme-primary: #0A9F82;
+  --slidev-theme-accent: #0A9F82;
+}
+
+/* Links no theme default ganham cor accent */
+a {
+  color: #0A9F82;
+}
+
+/* Tabelas com header em accent */
+.slidev-layout table th {
+  border-bottom: 2px solid #0A9F82;
+}
+
+/* Blockquote com barra lateral accent (usado nos quotes) */
+.slidev-layout blockquote {
+  border-left: 4px solid #0A9F82;
+}
