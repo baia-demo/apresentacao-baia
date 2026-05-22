@@ -8,29 +8,25 @@ a tool `submit_triage`. Não gaste todos os turnos explorando código.
 
 ## Repos (pasta ./repos/)
 
+A ShopFlow é um e-commerce com 3 repos. Você decide qual repo investigar
+pelo domínio do bug — depois usa Grep/Read pra encontrar o código.
+
 | Repo | Domínio |
 |---|---|
-| `catalog-api` | Catálogo — produtos, categorias, busca, normalização de texto |
-| `orders-api` | Pedidos — checkout, cálculo de total, frete, listagem |
-| `storefront-web` | Front-end Next.js — UI, carrinho (localStorage), fluxo de compra |
+| `catalog-api` | Backend — produtos, categorias, busca, estoque (Fastify + TS) |
+| `orders-api` | Backend — pedidos, checkout, cálculo de total, frete (Fastify + TS) |
+| `storefront-web` | Front — UI, carrinho (localStorage), formulários, fluxo de compra (Next.js + React) |
 
 ## Estratégia
 
-1. Identifique o repo provável pelo domínio do bug
-2. Use Grep no repo alvo para achar o código relevante (1–2 buscas)
-3. Use Read em 1–2 arquivos chave (services, components, routes, lib)
+1. Pelo domínio do bug, **escolha 1 repo** (não mais que 1)
+2. Use Grep buscando palavras-chave do sintoma no repo escolhido
+3. Use Read em 1–2 arquivos relevantes (services, components, routes, lib)
 4. Chame `submit_triage` com o veredito
 
-NÃO explore mais de 1 repo. NÃO leia arquivos genéricos
-(`server.ts`, `Dockerfile`, `package.json`, `tsconfig.json`, `next.config.ts`).
-
-## Heurísticas por domínio
-
-- **Busca, busca sem acento, termos não encontrados** → `catalog-api/src/services/searchService.ts` (função `tokenize`)
-- **Total, subtotal, frete, frete grátis, cálculo de valor de pedido** → `orders-api/src/services/totalCalculator.ts`
-- **Listagem de pedidos com valores errados, /orders mostrando dados estranhos** → `orders-api/src/routes/orders.ts` (handler do `GET /orders`)
-- **Botão, clique, formulário, UI travada, pedido duplicado por clique** → `storefront-web/components/CheckoutForm.tsx`
-- **Carrinho não soma, quantidade não acumula, "Adicionar" não funciona como esperado** → `storefront-web/lib/cart.ts` (função `addToCart`)
+NÃO leia arquivos genéricos (`server.ts`, `Dockerfile`, `package.json`,
+`tsconfig.json`, `next.config.ts`). NÃO clone repos manualmente — eles
+já estão em `./repos/`.
 
 ## Como reportar o resultado
 
