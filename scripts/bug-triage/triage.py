@@ -11,11 +11,12 @@ pelo GitHub Actions e:
   2. Remove a label `needs-triage` atomicamente (idempotência)
   3. Clona os repositórios da arquitetura (shallow)
   4. Dispara Claude Code em modo headless (read-only), conectado a um
-     MCP server local que expõe a tool `submit_triage`
-  5. Lê o veredito do arquivo JSON gravado pelo MCP server (output estruturado
-     com validação de schema dentro da tool — não dependemos de JSON livre)
-  6. Se for bug com confiança >= 0.5: cria issue no repo correto + comenta + fecha
-  7. Senão: comenta na issue original + atualiza labels
+     MCP server local que expõe a tool `submit_triage` (aceita LISTA
+     de findings — suporta reports com múltiplos bugs)
+  5. Lê o veredito de /tmp/triage_result.json (gravado pela tool)
+  6. Pra cada finding com is_bug + confidence >= 0.5: cria issue no repo
+  7. Posta UM comentário consolidado na issue original e fecha se houve
+     ao menos 1 issue técnica criada
 """
 
 import json
@@ -135,10 +136,7 @@ def add_issue_labels(repo: str, number: int, labels: list[str]) -> None:
 
 
 def remove_issue_label_atomic(repo: str, number: int, label: str) -> bool:
-    """Remove uma label específica. Retorna False se já não estava lá.
-
-    Usado pra idempotência — primeiro a remover ganha o processamento.
-    """
+    """Remove uma label específica. Retorna False se já não estava lá."""
     quoted = urllib.parse.quote(label, safe="")
     try:
         _github_request("DELETE", f"/repos/{repo}/issues/{number}/labels/{quoted}")
@@ -163,7 +161,6 @@ def close_issue(repo: str, number: int) -> None:
 
 
 def _write_mcp_config() -> Path:
-    """Cria o arquivo de config MCP que o Claude Code lê pra spawnar o server."""
     config = {
         "mcpServers": {
             "triage": {
@@ -187,7 +184,7 @@ def run_claude_triage(title: str, body: str) -> dict:
 
 ---
 
-## Bug para análise
+## Report para análise
 
 **Título:** {title}
 
@@ -196,11 +193,12 @@ def run_claude_triage(title: str, body: str) -> dict:
 
 ---
 
-Analise o bug acima navegando pelos repositórios em ./repos/. Quando tiver
-o veredito, chame a tool `submit_triage` (UMA vez) e encerre.
+Analise o report acima navegando pelos repositórios em ./repos/. Identifique
+quantos bugs distintos o usuário cita (a maioria dos reports tem 1). Quando
+tiver o veredito, chame a tool `submit_triage` (UMA vez) com a lista de
+findings e o `user_reply` consolidado, depois encerre.
 """
 
-    # Limpa output anterior pra detectar se a tool foi chamada nesta run
     TRIAGE_OUTPUT_FILE.unlink(missing_ok=True)
     mcp_config = _write_mcp_config()
 
@@ -226,7 +224,6 @@ o veredito, chame a tool `submit_triage` (UMA vez) e encerre.
         log.error("Claude Code timeout após %ds", CLAUDE_TIMEOUT)
         return _fallback_result(title, "Timeout na análise.")
 
-    # Log de métricas
     try:
         outer = json.loads(result.stdout)
         log.info(
@@ -248,18 +245,22 @@ o veredito, chame a tool `submit_triage` (UMA vez) e encerre.
         )
         return _fallback_result(
             title,
-            "Claude Code não chamou a tool submit_triage. "
-            "Provavelmente estourou turns ou abandonou a análise.",
+            "Claude Code não chamou submit_triage — provavelmente estourou turns.",
         )
 
     try:
         data = json.loads(TRIAGE_OUTPUT_FILE.read_text())
-        log.info(
-            "Veredito recebido via MCP: is_bug=%s confidence=%.2f target=%s",
-            data.get("is_bug"),
-            data.get("confidence", 0.0),
-            data.get("target_repo"),
-        )
+        findings = data.get("findings", [])
+        log.info("Veredito via MCP: %d finding(s)", len(findings))
+        for i, f in enumerate(findings):
+            log.info(
+                "  finding[%d]: is_bug=%s conf=%.2f target=%s — %s",
+                i,
+                f.get("is_bug"),
+                f.get("confidence", 0.0),
+                f.get("target_repo"),
+                (f.get("summary") or "")[:80],
+            )
         return data
     except (json.JSONDecodeError, OSError) as e:
         log.error("Falha lendo output MCP: %s", e)
@@ -268,15 +269,19 @@ o veredito, chame a tool `submit_triage` (UMA vez) e encerre.
 
 def _fallback_result(title: str, reason: str) -> dict:
     return {
-        "is_bug": False,
-        "confidence": 0.0,
-        "target_repo": None,
-        "files_analyzed": [],
-        "summary": f"Análise automática falhou para: {title}",
-        "explanation": reason,
-        "suggested_fix": None,
+        "findings": [
+            {
+                "is_bug": False,
+                "confidence": 0.0,
+                "target_repo": None,
+                "files_analyzed": [],
+                "summary": f"Análise automática falhou para: {title}",
+                "explanation": reason,
+                "suggested_fix": None,
+            }
+        ],
         "user_reply": (
-            f"Não consegui analisar este bug automaticamente. Motivo: "
+            f"Não consegui analisar este report automaticamente. Motivo: "
             f"{reason[:200]}. Vai precisar de uma olhada manual."
         ),
     }
@@ -292,8 +297,6 @@ def process_issue(issue: dict) -> None:
     body = issue.get("body") or "(sem descrição)"
     number = issue["number"]
 
-    # Idempotência: primeiro a remover a label ganha o processamento.
-    # Se já foi removida (outro runner / re-trigger), abortamos sem efeitos.
     if not remove_issue_label_atomic(REPORTS_REPO, number, TRIAGE_LABEL):
         log.info(
             "Issue #%d: label %s já removida — outro runner processou. Skip.",
@@ -305,71 +308,103 @@ def process_issue(issue: dict) -> None:
     log.info("=== Processando issue #%d: %s ===", number, title)
 
     result = run_claude_triage(title, body)
+    findings = result.get("findings", [])
+    user_reply = result.get("user_reply", "")
 
-    confidence = float(result.get("confidence") or 0)
-    is_bug = bool(result.get("is_bug"))
-    target_repo = result.get("target_repo")
+    # Cria issue técnica pra cada finding confirmado como bug
+    target_issues: list[tuple[dict, str]] = []  # (finding, issue_url)
+    for finding in findings:
+        confidence = float(finding.get("confidence") or 0)
+        if (
+            finding.get("is_bug")
+            and finding.get("target_repo")
+            and confidence >= UNDEFINED_CONFIDENCE_THRESHOLD
+        ):
+            try:
+                target_issue = create_issue(
+                    f"{GITHUB_ORG}/{finding['target_repo']}",
+                    f"[Auto-Triage] {finding.get('summary') or title}",
+                    _build_target_issue_body(issue, finding),
+                    labels=["bug", "auto-triage"],
+                )
+                target_issues.append((finding, target_issue.get("html_url", "?")))
+                log.info(
+                    "Issue criada em %s: %s",
+                    finding["target_repo"],
+                    target_issue.get("html_url"),
+                )
+            except Exception as e:
+                log.error(
+                    "Falha ao criar issue em %s: %s",
+                    finding.get("target_repo"),
+                    e,
+                )
 
-    target_issue_url: str | None = None
-    if is_bug and target_repo and confidence >= UNDEFINED_CONFIDENCE_THRESHOLD:
-        issue_body = _build_target_issue_body(issue, result)
-        try:
-            target_issue = create_issue(
-                f"{GITHUB_ORG}/{target_repo}",
-                f"[Auto-Triage] {title}",
-                issue_body,
-                labels=["bug", "auto-triage"],
-            )
-            target_issue_url = target_issue.get("html_url")
-            log.info("Issue criada em %s: %s", target_repo, target_issue_url)
-        except Exception as e:
-            log.error("Falha ao criar issue em %s: %s", target_repo, e)
-
-    comment = _build_origin_comment(result, target_issue_url)
+    # Posta UM comentário consolidado na issue original
+    comment = _build_origin_comment(findings, user_reply, target_issues)
     try:
         comment_on_issue(REPORTS_REPO, number, comment)
     except Exception as e:
         log.error("Falha ao comentar na issue #%d: %s", number, e)
 
-    add_labels = [TRIAGED_LABEL]
-    if confidence < UNDEFINED_CONFIDENCE_THRESHOLD:
-        add_labels.append("low-confidence")
-    elif is_bug:
-        add_labels.append(IS_BUG_LABEL)
-        if target_repo:
-            add_labels.append(f"repo:{target_repo}")
-    else:
-        add_labels.append(NOT_BUG_LABEL)
-
+    # Labels agregadas
+    add_labels = _aggregate_labels(findings, target_issues)
     try:
         add_issue_labels(REPORTS_REPO, number, add_labels)
     except Exception as e:
         log.error("Falha ao adicionar labels: %s", e)
 
-    if target_issue_url:
+    # Fecha se ao menos 1 issue técnica foi criada
+    if target_issues:
         try:
             close_issue(REPORTS_REPO, number)
         except Exception as e:
             log.error("Falha ao fechar issue #%d: %s", number, e)
 
 
-def _build_target_issue_body(origin: dict, result: dict) -> str:
-    files = result.get("files_analyzed", []) or []
+def _aggregate_labels(findings: list[dict], target_issues: list[tuple]) -> list[str]:
+    labels = [TRIAGED_LABEL]
+
+    high_conf_bugs = [
+        f for f in findings
+        if f.get("is_bug")
+        and float(f.get("confidence", 0)) >= UNDEFINED_CONFIDENCE_THRESHOLD
+    ]
+    any_bug_attempted = any(f.get("is_bug") for f in findings)
+
+    if high_conf_bugs:
+        labels.append(IS_BUG_LABEL)
+        repos_seen: set[str] = set()
+        for f in high_conf_bugs:
+            repo = f.get("target_repo")
+            if repo and repo not in repos_seen:
+                repos_seen.add(repo)
+                labels.append(f"repo:{repo}")
+    elif any_bug_attempted:
+        labels.append("low-confidence")
+    else:
+        labels.append(NOT_BUG_LABEL)
+
+    return labels
+
+
+def _build_target_issue_body(origin: dict, finding: dict) -> str:
+    files = finding.get("files_analyzed", []) or []
     files_lines = "\n".join(f"- `{f}`" for f in files) or "_(nenhum arquivo)_"
-    suggested = result.get("suggested_fix") or "_(sem sugestão)_"
+    suggested = finding.get("suggested_fix") or "_(sem sugestão)_"
 
     return (
         f"## Bug reportado via ShopFlow\n\n"
         f"**Issue original:** {origin.get('html_url', '?')}\n"
-        f"**Título:** {origin.get('title', '')}\n\n"
-        f"**Descrição original:**\n\n"
+        f"**Título do report:** {origin.get('title', '')}\n\n"
+        f"**Descrição original do reportador:**\n\n"
         f"{origin.get('body') or '_(sem descrição)_'}\n\n"
         f"---\n\n"
         f"## Análise automática (Claude Code)\n\n"
-        f"**Confiança:** {result.get('confidence', 0):.0%}\n\n"
-        f"**Resumo:** {result.get('summary', '')}\n\n"
+        f"**Confiança:** {finding.get('confidence', 0):.0%}\n\n"
+        f"**Resumo:** {finding.get('summary', '')}\n\n"
         f"**Explicação técnica:**\n\n"
-        f"{result.get('explanation', '')}\n\n"
+        f"{finding.get('explanation', '')}\n\n"
         f"**Arquivos analisados:**\n\n"
         f"{files_lines}\n\n"
         f"**Sugestão de correção:**\n\n"
@@ -378,18 +413,50 @@ def _build_target_issue_body(origin: dict, result: dict) -> str:
     )
 
 
-def _build_origin_comment(result: dict, target_issue_url: str | None) -> str:
-    confidence = float(result.get("confidence") or 0)
-    if confidence < UNDEFINED_CONFIDENCE_THRESHOLD:
-        verdict = f"**Análise inconclusiva** (confiança {confidence:.0%})"
-    elif result.get("is_bug"):
-        verdict = f"**Classificado como BUG** (confiança {confidence:.0%})"
-    else:
-        verdict = f"**Não identificado como bug** (confiança {confidence:.0%})"
+def _build_origin_comment(
+    findings: list[dict],
+    user_reply: str,
+    target_issues: list[tuple],
+) -> str:
+    high_conf_bugs = [
+        f for f in findings
+        if f.get("is_bug")
+        and float(f.get("confidence", 0)) >= UNDEFINED_CONFIDENCE_THRESHOLD
+    ]
+    any_bug_attempted = any(f.get("is_bug") for f in findings)
 
-    parts = [verdict, "", result.get("user_reply", "")]
-    if target_issue_url:
-        parts.extend(["", f"Issue técnica: {target_issue_url}"])
+    # Header
+    if not findings:
+        header = "**Análise inconclusiva**"
+    elif len(high_conf_bugs) == 0:
+        if any_bug_attempted:
+            header = "**Análise inconclusiva** — bugs identificados mas com baixa confiança"
+        else:
+            header = "**Não identificado como bug**"
+    elif len(high_conf_bugs) == 1:
+        f = high_conf_bugs[0]
+        header = f"**Classificado como BUG** (confiança {float(f['confidence']):.0%})"
+    else:
+        header = f"**{len(high_conf_bugs)} bugs identificados:**"
+        lines = []
+        for i, f in enumerate(high_conf_bugs, 1):
+            lines.append(
+                f"{i}. {f.get('summary', '(sem resumo)')} "
+                f"({float(f['confidence']):.0%} — `{f.get('target_repo', '?')}`)"
+            )
+        header += "\n\n" + "\n".join(lines)
+
+    parts = [header, "", user_reply]
+
+    if target_issues:
+        parts.append("")
+        if len(target_issues) == 1:
+            parts.append(f"Issue técnica: {target_issues[0][1]}")
+        else:
+            parts.append("Issues técnicas:")
+            for finding, url in target_issues:
+                parts.append(f"- `{finding.get('target_repo', '?')}`: {url}")
+
     return "\n".join(parts).strip()
 
 
@@ -399,7 +466,7 @@ def _build_origin_comment(result: dict, target_issue_url: str | None) -> str:
 
 
 def main() -> None:
-    log.info("=== Bug Triage Pipeline (MCP) ===")
+    log.info("=== Bug Triage Pipeline (MCP + multi-findings) ===")
     log.info("Reports repo: %s", REPORTS_REPO)
     log.info("Repos-alvo: %s", ", ".join(TARGET_REPOS))
 
