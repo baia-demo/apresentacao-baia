@@ -1,17 +1,17 @@
-# Triagem Autônoma de Bugs com Claude Code Headless
+# Triagem Autônoma de Feedback do Usuário com Claude Code Headless
 
 Demo pública da palestra do **BaIA** sobre como construir um pipeline de
-triagem autônoma de bugs com **Claude Code em modo headless** dentro do
-**GitHub Actions**.
+triagem autônoma de feedback do usuário (bugs, melhorias, dúvidas) com
+**Claude Code em modo headless** dentro do **GitHub Actions**.
 
 Faz parte da **ShopFlow** (e-commerce fictício da org [`baia-demo`](https://github.com/baia-demo)):
 
 | Repo | Stack | Função |
 |---|---|---|
-| [`storefront-web`](https://github.com/baia-demo/storefront-web) | Next.js 15 + Tailwind | UI da loja + form de "Reportar bug" |
+| [`storefront-web`](https://github.com/baia-demo/storefront-web) | Next.js 15 + Tailwind | UI da loja + widget "Central de ajuda" |
 | [`catalog-api`](https://github.com/baia-demo/catalog-api) | Fastify + TS | Produtos / busca |
 | [`orders-api`](https://github.com/baia-demo/orders-api) | Fastify + TS | Pedidos / total |
-| [`bug-reports`](https://github.com/baia-demo/bug-reports) | (sem código) | Recebe issues dos reports |
+| [`user-feedback`](https://github.com/baia-demo/user-feedback) | (sem código) | Recebe issues dos relatos |
 | **`apresentacao-baia`** (este) | Python + Actions | **Agente de triagem** |
 
 > Em produção (Konsi) o trigger é uma Slack List; aqui usamos um form web
@@ -22,25 +22,27 @@ Faz parte da **ShopFlow** (e-commerce fictício da org [`baia-demo`](https://git
 ```
 ┌──────────────────────────────┐
 │  ShopFlow (storefront-web)   │
-│  Usuário clica "Reportar bug"│
+│  Usuário clica                │
+│  "Central de ajuda"          │
 │  e preenche um form          │
 └────────────┬─────────────────┘
-             │ POST /api/report-bug
+             │ POST /api/feedback
              ▼
 ┌──────────────────────────────┐
 │  Next.js API route           │
 │  Cria issue em               │
-│  baia-demo/bug-reports       │
+│  baia-demo/user-feedback     │
 │  com label "needs-triage"    │
 └────────────┬─────────────────┘
              │ Workflow Relay
              │ (issues.labeled →
-             │  repository_dispatch)
+             │  repository_dispatch
+             │  "feedback-labeled")
              ▼
 ┌──────────────────────────────┐
 │  apresentacao-baia           │
-│  bug-triage.yml dispara      │
-│  triage.py                   │
+│  triage.yml dispara          │
+│  scripts/triage/triage.py    │
 └────────────┬─────────────────┘
              │
              ▼
@@ -49,21 +51,26 @@ Faz parte da **ShopFlow** (e-commerce fictício da org [`baia-demo`](https://git
 │  - Clona catalog/orders/web  │
 │  - Navega read-only          │
 │    (Read/Glob/Grep/LS)       │
-│  - Retorna JSON estruturado  │
+│  - Chama MCP tool            │
+│    submit_triage(findings,   │
+│                  user_reply) │
 └────────────┬─────────────────┘
-             │
-     ┌───────┴───────┐
-     ▼               ▼
-┌──────────┐  ┌──────────────┐
-│ É bug?   │  │ Não é bug?   │
-│ → cria   │  │ → comenta    │
-│   issue  │  │   na issue   │
-│   no repo│  │   original   │
-│   certo  │  └──────────────┘
-│ + comen- │
-│   ta +   │
-│   fecha  │
-└──────────┘
+             │ findings[].kind:
+             │  bug/improvement/
+             │  question/unclear
+             ▼
+     ┌───────┴───────────────┐
+     ▼                       ▼
+┌──────────────┐    ┌──────────────┐
+│ bug ou       │    │ question ou  │
+│ improvement  │    │ unclear      │
+│ (conf ≥ 0.5) │    │              │
+│ → cria issue │    │ → só comenta │
+│   no repo    │    │   na issue   │
+│   técnico    │    │   original   │
+│ + comenta +  │    │              │
+│   fecha      │    │              │
+└──────────────┘    └──────────────┘
 ```
 
 ## Decisões de design
@@ -73,25 +80,34 @@ Faz parte da **ShopFlow** (e-commerce fictício da org [`baia-demo`](https://git
   busca por sintoma + Grep no repo certo encontra a causa mais rápido que um
   índice vetorial — e qualquer repo novo entra sem reindexar.
 - **Read-only no agente.** `--allowedTools Read,Glob,Grep,LS`. Nunca edita.
+- **Output estruturado via MCP custom tool.** Em vez de pedir JSON livre na
+  resposta (frágil), o agente chama a tool `submit_triage` com schema
+  Pydantic. Schema valida cada campo no momento da call.
+- **Classificar antes de investigar.** Cada finding tem um `kind`
+  (bug/improvement/question/unclear). Reduz "confirmation bias" (agente
+  forçando como bug uma sugestão de melhoria).
+- **Múltiplos findings por report.** Um relato pode mencionar 2+ pontos
+  distintos — cada um vira issue técnica separada no repo certo.
 - **Timeout duro.** `CLAUDE_TIMEOUT = 480s` + `--max-turns 25`. Cai num
   fallback "inconclusivo" se estourar.
 - **Confiança < 0.5 ⇒ inconclusivo.** Não cria issue técnica, só rotula como
   `low-confidence` na issue original. Reduz ruído.
-- **JSON-first.** Quando o modelo gasta os turnos sem retornar JSON, usa
-  `--resume` pra pedir só o JSON final.
-- **Idempotência via labels.** A issue original ganha `triaged` e perde
-  `needs-triage`, então re-runs do mesmo evento não duplicam triagem.
+- **Idempotência via labels.** Remove `needs-triage` ANTES de processar
+  (atomic). Primeiro runner a remover ganha — re-runs / dispatch concorrentes
+  não duplicam.
 
 ## Estrutura
 
 ```
 apresentacao-baia/
 ├── .github/workflows/
-│   ├── bug-triage.yml          # Roda aqui — chama o triage.py
-│   └── relay-bug-reports.yml   # Referência — copie pro repo bug-reports
-└── scripts/bug-triage/
-    ├── triage.py               # Script principal (stdlib only)
-    └── CLAUDE_TRIAGE.md        # Prompt do agente
+│   ├── triage.yml              # Roda aqui — chama triage.py
+│   └── tests.yml               # CI dos testes unitários
+└── scripts/triage/
+    ├── triage.py               # Orchestrator (stdlib only)
+    ├── triage_mcp_server.py    # MCP server com tool submit_triage
+    ├── CLAUDE_TRIAGE.md        # Prompt do agente
+    └── tests/                  # Testes unitários (unittest)
 ```
 
 ## Setup
@@ -100,46 +116,45 @@ apresentacao-baia/
 
 | Secret | Descrição |
 |---|---|
-| `GH_PAT` | Fine-grained PAT com `issues:write` em `bug-reports` + repos-alvo |
+| `GH_PAT` | Fine-grained PAT com `issues:write` em `user-feedback` + repos-alvo |
 | `ANTHROPIC_API_KEY` | API key da Anthropic |
 
 ### 2. Variables
 
 | Variable | Exemplo | Descrição |
 |---|---|---|
-| `GITHUB_ORG` | `baia-demo` | Org dona dos repos |
-| `REPORTS_REPO` | `baia-demo/bug-reports` | Repo onde os reports viram issues |
+| `ORG_NAME` | `baia-demo` | Org dona dos repos |
+| `REPORTS_REPO` | `baia-demo/user-feedback` | Repo onde os relatos viram issues |
 | `TARGET_REPOS` | `catalog-api,orders-api,storefront-web` | Lista comma-separated dos repos analisados |
 
-### 3. Secret + var no repo `bug-reports`
+### 3. Secret + var no repo `user-feedback`
 
 | Local | Nome | Valor |
 |---|---|---|
-| Secret | `RELAY_TOKEN` | PAT com `repo` (dispara `repository_dispatch` no apresentacao-baia) |
+| Secret | `RELAY_TOKEN` | PAT com `Contents:write` em `apresentacao-baia` (dispara `repository_dispatch`) |
 | Variable | `TRIAGE_REPO` | `baia-demo/apresentacao-baia` |
 
-E copie `.github/workflows/relay-bug-reports.yml` deste repo pra dentro do
-`bug-reports` (caminho `.github/workflows/relay.yml`).
+A relay workflow já vive em `user-feedback/.github/workflows/relay.yml`.
 
 ### 4. Token na ShopFlow
 
 No `storefront-web` (Fly secrets), defina `REPORTS_GITHUB_TOKEN` como um PAT
-com `issues:write` no `bug-reports`. O form web usa ele pra abrir as issues.
+com `Issues:write` no `user-feedback`. O form web usa ele pra abrir as issues.
 
 ## Disparar
 
-- **Automático:** novo report no form → issue ganha `needs-triage` → relay
-  dispara o triage no `apresentacao-baia`.
-- **Manual em lote:** `gh workflow run bug-triage.yml -f force_all=true` —
+- **Automático:** novo relato no form → issue ganha `needs-triage` → relay
+  dispara a triagem no `apresentacao-baia` via `feedback-labeled` event.
+- **Manual em lote:** `gh workflow run triage.yml -f force_all=true` —
   processa todas as issues abertas com `needs-triage`.
-- **Manual com limite:** `gh workflow run bug-triage.yml -f max_issues=1`.
+- **Manual com limite:** `gh workflow run triage.yml -f max_issues=1`.
 
-## Custos típicos
+## Custos e métricas (medidos em runs reais)
 
-- **Claude Code:** ~$0.05–0.30 por bug
-- **GitHub Actions:** 2–5 min por bug em `ubuntu-latest`
-- **Latência:** ~30s do report até a issue técnica aparecer no repo-alvo
-  (quase tudo é boot do runner + npm install do CLI)
+- **Claude Code:** $0.05–0.30 por relato (variou conforme complexidade)
+- **Turns típicos:** 4–7 com MCP tool (era 20–25 com JSON livre)
+- **Latência:** ~30s do submit do form até issue técnica aparecer
+- **Confiança típica em bugs reais:** 95–98%
 
 ## Versão de produção
 

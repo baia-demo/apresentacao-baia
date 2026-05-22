@@ -1,8 +1,8 @@
-name: Bug Triage Automático
+name: Triage Automática
 
 on:
   repository_dispatch:
-    types: [bug-report-labeled]
+    types: [feedback-labeled]
   workflow_dispatch:
     inputs:
       max_issues:
@@ -62,7 +62,7 @@ jobs:
           done
 
       - name: Executar triagem
-        run: python scripts/bug-triage/triage.py
+        run: python scripts/triage/triage.py
         env:
           TRIGGERING_ISSUE: ${{ github.event.client_payload.issue_number || '' }}
           MAX_ISSUES: ${{ github.event.inputs.max_issues || '0' }}
