@@ -186,24 +186,26 @@ layout: section
 
 # Do clique no form até prod
 
-```mermaid {scale: 0.55}
+```mermaid {scale: 0.7}
 flowchart TD
-  A[Usuário envia feedback] -->|POST /api/feedback| B[Issue em user-feedback<br/>label: needs-triage]
-  B -->|relay workflow| C[repository_dispatch<br/>feedback-labeled]
-  C --> D[triage.py: Claude Sonnet<br/>navega código read-only]
-  D -->|submit_triage tool| E{kind?}
-  E -->|rejected| Z1[Comenta + fecha<br/>not_planned]
-  E -->|question/unclear| Z2[Comenta<br/>aguarda info]
-  E -->|bug/improvement| F[Dedup: Haiku verifica<br/>issues abertas]
-  F -->|duplicada| Z3["+1 na existente<br/>fecha origem"]
-  F -->|nova| G[Cria issue técnica]
-  G -->|conf ≥ 0.9| H[Claude com Edit/Write<br/>aplica fix em local clone]
-  H --> I[Push branch + abre PR]
-  I --> J[ci.yml na PR:<br/>test + preview-deploy + preview-smoke]
-  J -->|verde| K[Merge via API + PAT]
-  K --> L[ci.yml em main:<br/>test + deploy + smoke]
-  L --> M[🎉 Bug fixed em prod]
+  A[Feedback do usuário] --> B[Triage Sonnet<br/>classifica + analisa]
+  B --> C{kind?}
+  C -->|rejected /<br/>question /<br/>unclear| Z[Só comenta]
+  C -->|bug ou<br/>improvement| D[Dedup Haiku]
+  D -->|duplicada| Y["+1 na existente"]
+  D -->|nova| E[Cria issue técnica]
+  E -->|conf ≥ 0.9| F[Claude aplica fix<br/>+ abre PR]
+  F --> G[CI da PR:<br/>test + preview deploy + smoke]
+  G -->|verde| H[Merge via PAT]
+  H --> I[CI main:<br/>deploy + smoke prod]
 ```
+
+<div class="text-sm opacity-70 pt-2">
+
+Detalhe completo (incluindo workflows e dispatches): no repo
+`baia-demo/apresentacao-baia/scripts/triage/triage.py`.
+
+</div>
 
 ---
 
@@ -392,19 +394,19 @@ Custo do dedup: **$0.001 por call**. Negligível vs $0.10 do auto-fix evitado.
 
 # Decisão 5: Preview deploy antes de auto-merge
 
-```mermaid {scale: 0.6}
-flowchart LR
-  A[PR auto-fix aberta] --> B[test: npm test]
-  B -->|green| C[preview-deploy<br/>cria shopflow-X-pr-N no Fly]
-  C --> D[preview-smoke<br/>curl checks na preview URL]
-  D -->|green| E[triage.py mergeia via API + PAT]
-  E --> F[main ci.yml<br/>test + deploy prod + smoke]
-  F --> G[preview-cleanup<br/>flyctl apps destroy]
+```mermaid {scale: 0.75}
+flowchart TD
+  A[PR auto-fix] --> B[test]
+  B -->|verde| C[preview-deploy<br/>shopflow-X-pr-N]
+  C --> D[preview-smoke]
+  D -->|verde| E[Merge via PAT]
+  E --> F[Main CI:<br/>deploy + smoke prod]
+  F --> G[preview-cleanup<br/>destroy app]
 ```
 
 - App efêmera por PR, destruída no `closed` event
-- Mesmas smoke checks da prod, contra preview URL
-- **Zero risco em prod até passar todos os checks**
+- Smoke roda contra preview URL antes do merge
+- **Zero risco em prod até passar test + preview-smoke + (na main) smoke prod**
 
 ---
 
