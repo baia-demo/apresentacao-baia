@@ -1,0 +1,66 @@
+name: Bug Triage Automático
+
+on:
+  repository_dispatch:
+    types: [bug-report-labeled]
+  workflow_dispatch:
+    inputs:
+      max_issues:
+        description: "Máximo de issues a processar (0 = todas as abertas com label)"
+        required: false
+        default: "0"
+        type: string
+      force_all:
+        description: "Processar todas mesmo se houver TRIGGERING_ISSUE"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+env:
+  GH_PAT: ${{ secrets.GH_PAT }}
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  GITHUB_ORG: ${{ vars.ORG_NAME }}
+  REPORTS_REPO: ${{ vars.REPORTS_REPO }}
+  TARGET_REPOS: ${{ vars.TARGET_REPOS }}
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Instalar Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Clonar repositórios-alvo (shallow)
+        run: |
+          mkdir -p repos
+          IFS=',' read -ra REPOS <<< "${TARGET_REPOS}"
+          for repo in "${REPOS[@]}"; do
+            repo="$(echo "$repo" | xargs)"
+            echo "Clonando ${GITHUB_ORG}/${repo}..."
+            git clone --depth 1 "https://x-access-token:${GH_PAT}@github.com/${GITHUB_ORG}/${repo}.git" "repos/${repo}"
+          done
+
+      - name: Executar triagem
+        run: python scripts/bug-triage/triage.py
+        env:
+          TRIGGERING_ISSUE: ${{ github.event.client_payload.issue_number || '' }}
+          MAX_ISSUES: ${{ github.event.inputs.max_issues || '0' }}
+          FORCE_ALL: ${{ github.event.inputs.force_all || 'false' }}
