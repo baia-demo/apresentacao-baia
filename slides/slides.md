@@ -3,7 +3,7 @@ theme: seriph
 title: Triagem Autônoma com Claude Code Headless
 info: |
   Palestra BaIA · 2026
-  Douglas Pessoal · Konsi
+  Douglas Wiliam · Engineering Manager @ Konsi
 class: text-center
 highlighter: shiki
 drawings:
@@ -24,7 +24,7 @@ Do report do usuário ao deploy em produção — **em 4 minutos, sem humano no 
 
 <div class="pt-12">
   <span class="px-2 py-1 rounded bg-white/10 text-sm">
-    Douglas Pessoal · Konsi · BaIA 2026
+    Douglas Wiliam · Engineering Manager @ Konsi · BaIA 2026
   </span>
 </div>
 
@@ -33,6 +33,47 @@ Abertura: começar com a pergunta provocativa.
 "Quanto tempo um engenheiro sênior gasta pra triar 1 bug do Slack?
 20-40 minutos. Em times multi-repo, mais ainda. Hoje vou mostrar
 como um agente faz isso em ~4 minutos, por $0.40."
+-->
+
+---
+layout: center
+class: text-center
+---
+
+# Douglas Wiliam
+
+**Engineering Manager @ Konsi** — fintech de crédito consignado
+
+<div class="pt-6 text-base opacity-90 max-w-2xl mx-auto leading-relaxed">
+
+Lidero 2 squads cross-functional (~7 pessoas) na Konsi e toco a estratégia
+de **observabilidade** da empresa (OKR de engenharia). Antes disso, fui o
+**founding backend engineer do projeto Konsi** — então o multi-repo .NET
+que vou citar como caso de produção, **eu construí**.
+
+</div>
+
+<div class="pt-6 text-sm opacity-70 max-w-2xl mx-auto">
+
+Linux desde os 12 anos · co-fundei 2 empresas juniores na faculdade ·
+Stack atual: .NET (C#), Python, AWS, RabbitMQ · SRE/observabilidade
+
+</div>
+
+<div class="pt-8 text-sm">
+
+<a href="https://github.com/douglas-wiliam" class="text-amber-400">github.com/douglas-wiliam</a>
+
+</div>
+
+<!--
+30s aqui no máximo. Falar:
+- "EM no Konsi, fintech de consignado"
+- "Construí o backend do produto desde o início, então o multi-repo que vou
+  citar como prod, eu conheço de dentro"
+- "Hoje, foco grande em observabilidade — que tá ligado a este tema porque
+  o agente PRECISA saber detectar quando algo deu errado"
+Depois transiciona pra o problema.
 -->
 
 ---
@@ -796,7 +837,7 @@ Live demo: <a href="https://shopflow-storefront.fly.dev" class="text-amber-400">
 
 <div class="text-lg pt-12 opacity-80">
 
-Douglas Pessoal · Konsi · BaIA 2026
+Douglas Wiliam · Engineering Manager @ Konsi · BaIA 2026
 
 </div>
 
