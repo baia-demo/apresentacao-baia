@@ -4,20 +4,28 @@ Triage Pipeline (BaIA demo) — GitHub Issues + Claude Code headless + MCP.
 Roda no GitHub Actions, dispara Claude Code em modo headless conectado a um
 MCP server local que expõe a tool `submit_triage(findings, user_reply)`.
 
-Cada finding tem um `kind` (bug/improvement/question/unclear). Bugs e
-improvements com confiança >= 0.5 viram issues técnicas no repo certo
-(labels diferentes — `bug` vs `enhancement`). Questions e unclear ficam
-só no comentário.
+Cada finding tem um `kind` (bug/improvement/question/unclear/rejected).
 
-Auto-fix: pra findings com kind bug/improvement E confidence >= 0.9, o
-agente re-executa Claude no clone do repo-alvo (desta vez com permissão
-de Edit/Write/Bash), aplica o fix, commita, abre PR. O ci.yml do repo
-alvo cuida de test + preview deploy + smoke + auto-merge.
+  - bug/improvement com confidence >= 0.5: viram issue técnica no target_repo
+  - bug/improvement com confidence >= 0.9: AUTO-FIX (Claude com Edit/Write
+    aplica o fix, abre PR, espera CI, mergeia)
+  - rejected (conf >= 0.7): comenta na origem explicando, fecha como not_planned
+  - question/unclear: só comenta
+
+Dedupe semântica: ANTES de criar issue técnica, lista issues abertas com
+label `auto-triage` no target_repo e usa Claude (Haiku) pra checar se o
+novo finding é duplicata. Se for, comenta na issue existente e fecha a
+user-feedback ao invés de criar nova.
+
+Métricas: cost USD, turns, duração acumulados ao longo de todas chamadas
+Claude (triage + dedup + auto-fix) — visíveis no log, no GH Actions
+summary e no comentário final na issue de origem.
 """
 
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 import urllib.request
@@ -58,24 +66,26 @@ MCP_CONFIG_FILE = Path("/tmp/triage_mcp_config.json")
 REPOS_DIR = Path("repos")
 CLAUDE_TIMEOUT = 480
 CLAUDE_FIX_TIMEOUT = 600
+DEDUP_TIMEOUT = 60
 
 UNDEFINED_CONFIDENCE_THRESHOLD = 0.5
+REJECTION_CONFIDENCE_THRESHOLD = 0.7
 AUTO_FIX_CONFIDENCE_THRESHOLD = 0.9
 AUTO_FIX_BRANCH_PREFIX = "auto-fix/"
 AUTO_FIX_KINDS = {"bug", "improvement"}
+AUTO_TRIAGE_LABEL = "auto-triage"  # aplicado em issues técnicas (usado pra dedup)
 
-# Labels aplicadas no repo de target por kind
 KIND_TO_TARGET_LABELS = {
-    "bug": ["bug", "auto-triage"],
-    "improvement": ["enhancement", "auto-triage"],
+    "bug": ["bug", AUTO_TRIAGE_LABEL],
+    "improvement": ["enhancement", AUTO_TRIAGE_LABEL],
 }
 
-# Labels aplicadas no repo de feedback (origem) por kind
 KIND_TO_ORIGIN_LABELS = {
     "bug": "is-bug",
     "improvement": "is-improvement",
     "question": "is-question",
     "unclear": "needs-info",
+    "rejected": "rejected",
 }
 
 logging.basicConfig(
@@ -83,6 +93,31 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger("triage")
+
+
+# ---------------------------------------------------------------------------
+# Métricas acumuladas durante o processamento de uma issue
+# ---------------------------------------------------------------------------
+
+
+def new_metrics() -> dict:
+    return {"cost_usd": 0.0, "turns": 0, "duration_s": 0.0, "calls": 0}
+
+
+def accumulate(metrics: dict, call_label: str, outer_json: dict | None) -> None:
+    if not outer_json:
+        return
+    cost = float(outer_json.get("total_cost_usd", 0) or 0)
+    turns = int(outer_json.get("num_turns", 0) or 0)
+    duration = float(outer_json.get("duration_ms", 0) or 0) / 1000
+    metrics["cost_usd"] += cost
+    metrics["turns"] += turns
+    metrics["duration_s"] += duration
+    metrics["calls"] += 1
+    log.info(
+        "Métrica [%s]: %d turns, %.1fs, $%.4f (acumulado: $%.4f em %d call(s))",
+        call_label, turns, duration, cost, metrics["cost_usd"], metrics["calls"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +180,6 @@ def create_pull_request(
 
 
 def wait_for_pr_checks(repo: str, pr_number: int, timeout: int = 900) -> bool:
-    """Espera os checks da PR completarem. Retorna True se todos passaram."""
     start = time.time()
     last_state: list[str] = []
     while time.time() - start < timeout:
@@ -191,7 +225,6 @@ def wait_for_pr_checks(repo: str, pr_number: int, timeout: int = 900) -> bool:
 
 
 def merge_pr(repo: str, pr_number: int) -> bool:
-    """Faz squash merge via API. Retorna True se mergeou."""
     try:
         result = _github_request(
             "PUT",
@@ -201,7 +234,6 @@ def merge_pr(repo: str, pr_number: int) -> bool:
         if not result or not result.get("merged"):  # type: ignore[union-attr]
             log.warning("Merge API não confirmou: %s", result)
             return False
-        # Best-effort: deleta branch
         try:
             pr = _github_request("GET", f"/repos/{repo}/pulls/{pr_number}")
             branch = pr["head"]["ref"]  # type: ignore[index]
@@ -241,12 +273,119 @@ def remove_issue_label_atomic(repo: str, number: int, label: str) -> bool:
         raise
 
 
-def close_issue(repo: str, number: int) -> None:
+def close_issue(repo: str, number: int, reason: str = "completed") -> None:
     _github_request(
         "PATCH",
         f"/repos/{repo}/issues/{number}",
-        body={"state": "closed", "state_reason": "completed"},
+        body={"state": "closed", "state_reason": reason},
     )
+
+
+# ---------------------------------------------------------------------------
+# Dedup semântica (LLM-based, Haiku)
+# ---------------------------------------------------------------------------
+
+
+def find_duplicate_issue(
+    target_repo: str,
+    summary: str,
+    kind: str,
+    metrics: dict,
+) -> dict | None:
+    """Verifica se o novo finding duplica alguma issue auto-triage aberta no target_repo.
+
+    Retorna a issue dict (dict do GitHub) ou None.
+    """
+    candidates = list_open_issues_with_label(
+        f"{GITHUB_ORG}/{target_repo}", AUTO_TRIAGE_LABEL
+    )
+    if not candidates:
+        log.info("Dedup [%s]: nenhuma issue auto-triage aberta — skip", target_repo)
+        return None
+
+    log.info(
+        "Dedup [%s]: comparando finding com %d candidata(s) abertas",
+        target_repo,
+        len(candidates),
+    )
+
+    issues_block = "\n".join(
+        f"#{i['number']}: {i.get('title', '')}\n"
+        f"   Excerpt: {((i.get('body') or '')[:300]).strip()}"
+        for i in candidates[:8]
+    )
+
+    prompt = f"""Você compara se um report novo é duplicado de issues existentes.
+
+NEW FINDING:
+  kind: {kind}
+  summary: {summary}
+
+EXISTING OPEN auto-triage ISSUES in {target_repo}:
+{issues_block}
+
+PERGUNTA: o NEW finding descreve a MESMA causa raiz que alguma das existentes?
+
+Responda com EXATAMENTE uma palavra:
+- O número da issue (só o inteiro, sem '#'), se for duplicata
+- "none", se NÃO for duplicata de nenhuma
+
+Seja conservador: só marque como duplicata se tiver certeza que a causa raiz é a mesma.
+Não explique. Só o número ou "none".
+"""
+
+    try:
+        result = subprocess.run(
+            [
+                "claude",
+                "-p", prompt,
+                "--output-format", "json",
+                "--max-turns", "1",
+                "--model", "claude-haiku-4-5",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=DEDUP_TIMEOUT,
+            env={**os.environ, "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY},
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("Dedup timeout — não consegui checar duplicatas")
+        return None
+
+    if result.returncode != 0:
+        log.warning("Dedup rc=%d stderr: %s", result.returncode, result.stderr[:200])
+        return None
+
+    try:
+        outer = json.loads(result.stdout)
+        accumulate(metrics, "dedup", outer)
+        response_text = (outer.get("result") or "").strip().lower()
+    except (json.JSONDecodeError, TypeError):
+        log.warning("Dedup output não-JSON: %s", result.stdout[:200])
+        return None
+
+    if not response_text or "none" in response_text:
+        log.info("Dedup [%s]: sem duplicata", target_repo)
+        return None
+
+    match = re.search(r"\b(\d+)\b", response_text)
+    if not match:
+        log.warning("Dedup output sem número: %s", response_text[:100])
+        return None
+
+    dup_number = int(match.group(1))
+    for issue in candidates:
+        if issue["number"] == dup_number:
+            log.info(
+                "Dedup [%s]: finding é duplicata de #%d (%s)",
+                target_repo,
+                dup_number,
+                issue.get("title", "")[:60],
+            )
+            return issue
+
+    log.warning("Dedup: agente apontou #%d mas não está na lista", dup_number)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +410,7 @@ def _write_mcp_config() -> Path:
     return MCP_CONFIG_FILE
 
 
-def run_claude_triage(title: str, body: str) -> dict:
+def run_claude_triage(title: str, body: str, metrics: dict) -> dict:
     instructions = CLAUDE_TRIAGE_MD.read_text()
 
     prompt = f"""{instructions}
@@ -288,7 +427,7 @@ def run_claude_triage(title: str, body: str) -> dict:
 ---
 
 Analise o report navegando pelos repositórios em ./repos/ se necessário.
-Comece classificando os pontos do report (bug/improvement/question/unclear).
+Comece classificando os pontos do report (bug/improvement/question/unclear/rejected).
 Investigue código somente pra bug/improvement. Quando tiver o veredito,
 chame `submit_triage` UMA vez com os findings e o user_reply, depois encerre.
 """
@@ -315,19 +454,14 @@ chame `submit_triage` UMA vez com os findings e o user_reply, depois encerre.
             env={**os.environ, "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY},
         )
     except subprocess.TimeoutExpired:
-        log.error("Claude Code timeout após %ds", CLAUDE_TIMEOUT)
+        log.error("Claude triagem timeout após %ds", CLAUDE_TIMEOUT)
         return _fallback_result(title, "Timeout na análise.")
 
     try:
         outer = json.loads(result.stdout)
-        log.info(
-            "Claude triagem: %d turns, %.1fs, $%.4f",
-            outer.get("num_turns", 0),
-            outer.get("duration_ms", 0) / 1000,
-            outer.get("total_cost_usd", 0),
-        )
+        accumulate(metrics, "triage", outer)
     except (json.JSONDecodeError, TypeError):
-        pass
+        outer = None
 
     if result.returncode != 0:
         log.error("Claude triagem rc=%d stderr: %s", result.returncode, result.stderr[:500])
@@ -382,18 +516,21 @@ def _fallback_result(title: str, reason: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Auto-fix (Claude Code com Edit/Write/Bash no repo-alvo)
+# Auto-fix
 # ---------------------------------------------------------------------------
 
 
 def _run(cmd: list[str], cwd: str | Path, **kwargs) -> subprocess.CompletedProcess:
-    """Wrapper de subprocess.run que loga e levanta em rc != 0."""
     log.debug("$ %s (cwd=%s)", " ".join(cmd), cwd)
     return subprocess.run(cmd, cwd=str(cwd), check=True, **kwargs)
 
 
-def run_auto_fix(finding: dict, origin_issue: dict, target_issue: dict) -> str | None:
-    """Aplica fix automático no repo-alvo, abre PR. Retorna URL da PR ou None."""
+def run_auto_fix(
+    finding: dict,
+    origin_issue: dict,
+    target_issue: dict,
+    metrics: dict,
+) -> str | None:
     repo = finding["target_repo"]
     work_dir = REPOS_DIR / repo
     if not work_dir.exists():
@@ -404,19 +541,17 @@ def run_auto_fix(finding: dict, origin_issue: dict, target_issue: dict) -> str |
     log.info("Auto-fix em %s: branch %s", repo, branch)
 
     try:
-        # Garante histórico completo + branch
         try:
             _run(["git", "fetch", "--unshallow"], cwd=work_dir,
                  capture_output=True, text=True)
         except subprocess.CalledProcessError:
-            pass  # já era full clone
+            pass
 
         _run(["git", "config", "user.email", "auto-fix-agent@baia-demo.dev"], cwd=work_dir)
         _run(["git", "config", "user.name", "Auto-fix Agent (Claude)"], cwd=work_dir)
         _run(["git", "checkout", "-b", branch], cwd=work_dir,
              capture_output=True, text=True)
 
-        # Roda Claude com permissões de edição/escrita
         fix_prompt = _build_fix_prompt(repo, origin_issue, target_issue, finding)
         log.info("Executando Claude (fix mode) em %s...", work_dir)
         result = subprocess.run(
@@ -437,12 +572,7 @@ def run_auto_fix(finding: dict, origin_issue: dict, target_issue: dict) -> str |
 
         try:
             outer = json.loads(result.stdout)
-            log.info(
-                "Claude fix: %d turns, %.1fs, $%.4f",
-                outer.get("num_turns", 0),
-                outer.get("duration_ms", 0) / 1000,
-                outer.get("total_cost_usd", 0),
-            )
+            accumulate(metrics, f"fix:{repo}", outer)
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -450,7 +580,6 @@ def run_auto_fix(finding: dict, origin_issue: dict, target_issue: dict) -> str |
             log.error("Claude fix rc=%d stderr: %s", result.returncode, result.stderr[:500])
             return None
 
-        # Confere se houve mudança
         diff = subprocess.run(
             ["git", "diff", "--stat"], cwd=str(work_dir),
             capture_output=True, text=True,
@@ -466,12 +595,10 @@ def run_auto_fix(finding: dict, origin_issue: dict, target_issue: dict) -> str |
         _run(["git", "commit", "-m", commit_msg], cwd=work_dir,
              capture_output=True, text=True)
 
-        # Push usando o GH_PAT
         push_url = f"https://x-access-token:{GH_PAT}@github.com/{GITHUB_ORG}/{repo}.git"
         _run(["git", "push", push_url, f"HEAD:{branch}"], cwd=work_dir,
              capture_output=True, text=True)
 
-        # Abre PR
         pr = create_pull_request(
             f"{GITHUB_ORG}/{repo}",
             title=f"{_pr_title_prefix(finding)} {finding.get('summary', '')}"[:100],
@@ -483,9 +610,6 @@ def run_auto_fix(finding: dict, origin_issue: dict, target_issue: dict) -> str |
         pr_number = pr.get("number")
         log.info("PR aberta: %s", pr_url)
 
-        # Espera o ci.yml da PR (test + preview-deploy + preview-smoke) passar.
-        # Se passar, mergeia com squash via PAT (necessário pra que o ci.yml do
-        # main rode depois — GITHUB_TOKEN não dispara workflows downstream).
         if pr_number:
             log.info("Aguardando checks da PR #%s...", pr_number)
             ok = wait_for_pr_checks(f"{GITHUB_ORG}/{repo}", pr_number, timeout=900)
@@ -539,11 +663,9 @@ def _build_fix_prompt(repo: str, origin: dict, target: dict, finding: dict) -> s
 2. Se existirem tests cobrindo a área, garanta que continuam passando.
    Se NÃO existir teste cobrindo o caso específico do bug, adicione um
    teste mínimo (junto com o fix) que reproduziria o bug e agora passa.
-3. Rode `npm test` (este repo é Node) ou `npm run test` pra confirmar que
-   tudo passa antes de terminar.
+3. Rode `npm test` pra confirmar que tudo passa antes de terminar.
 4. NÃO commite — só edite. O workflow que te chamou vai commitar e abrir PR.
-5. Quando terminar, descreva em 2-3 linhas o que fez (texto livre, não
-   precisa de JSON).
+5. Quando terminar, descreva em 2-3 linhas o que fez (texto livre).
 
 Restrição de escopo: limite-se a `{repo}`. Não toque em outros repos.
 """
@@ -578,9 +700,7 @@ def _build_pr_body(finding: dict, origin: dict, target: dict) -> str:
         f"## Fix sugerido pela triagem\n\n"
         f"{finding.get('suggested_fix') or '_(sem sugestão específica)_'}\n\n"
         f"---\n\n"
-        f"Closes #{target.get('number')}.\n\n"
-        f"Auto-merge habilitado pelo `ci.yml`: a PR será mergeada quando "
-        f"`test` + `preview-deploy` + `preview-smoke` passarem."
+        f"Closes #{target.get('number')}.\n"
     )
 
 
@@ -609,6 +729,12 @@ def _is_auto_fix_eligible(finding: dict) -> bool:
     )
 
 
+def _is_rejection(finding: dict) -> bool:
+    kind = finding.get("kind")
+    confidence = float(finding.get("confidence") or 0)
+    return kind == "rejected" and confidence >= REJECTION_CONFIDENCE_THRESHOLD
+
+
 def process_issue(issue: dict) -> None:
     title = issue.get("title", "(sem título)")
     body = issue.get("body") or "(sem descrição)"
@@ -623,20 +749,39 @@ def process_issue(issue: dict) -> None:
         return
 
     log.info("=== Processando issue #%d: %s ===", number, title)
+    metrics = new_metrics()
 
-    result = run_claude_triage(title, body)
+    result = run_claude_triage(title, body, metrics)
     findings = result.get("findings", [])
     user_reply = result.get("user_reply", "")
 
-    # Cria issue técnica pra cada finding actionable
-    target_issues: list[tuple[dict, dict]] = []  # (finding, target_issue)
+    target_issues: list[tuple[dict, dict]] = []
+    duplicates: list[tuple[dict, dict]] = []
+    fix_prs: list[tuple[dict, str]] = []
+
     for finding in findings:
         if not _is_actionable(finding):
             continue
+        kind = finding["kind"]
+        target_repo = finding["target_repo"]
+
+        dup = find_duplicate_issue(target_repo, finding.get("summary", ""), kind, metrics)
+        if dup:
+            try:
+                comment_on_issue(
+                    f"{GITHUB_ORG}/{target_repo}",
+                    dup["number"],
+                    _build_duplicate_comment(issue, finding),
+                )
+                duplicates.append((finding, dup))
+                log.info("Anexado como duplicata em %s#%d", target_repo, dup["number"])
+            except Exception as e:
+                log.error("Falha comentando na issue duplicada: %s", e)
+            continue
+
         try:
-            kind = finding["kind"]
             target_issue = create_issue(
-                f"{GITHUB_ORG}/{finding['target_repo']}",
+                f"{GITHUB_ORG}/{target_repo}",
                 _target_title(kind, finding, title),
                 _build_target_issue_body(issue, finding),
                 labels=KIND_TO_TARGET_LABELS[kind],
@@ -645,19 +790,12 @@ def process_issue(issue: dict) -> None:
             log.info(
                 "Issue %s criada em %s: %s",
                 kind,
-                finding["target_repo"],
+                target_repo,
                 target_issue.get("html_url"),
             )
         except Exception as e:
-            log.error(
-                "Falha ao criar issue em %s (%s): %s",
-                finding.get("target_repo"),
-                finding.get("kind"),
-                e,
-            )
+            log.error("Falha ao criar issue em %s (%s): %s", target_repo, kind, e)
 
-    # Auto-fix pra findings elegíveis (confidence >= 0.9)
-    fix_prs: list[tuple[dict, str]] = []  # (finding, pr_url)
     for finding, target_issue in target_issues:
         if not _is_auto_fix_eligible(finding):
             continue
@@ -668,34 +806,43 @@ def process_issue(issue: dict) -> None:
             finding.get("confidence", 0),
         )
         try:
-            pr_url = run_auto_fix(finding, issue, target_issue)
+            pr_url = run_auto_fix(finding, issue, target_issue, metrics)
             if pr_url:
                 fix_prs.append((finding, pr_url))
         except Exception as e:
             log.exception("Auto-fix falhou: %s", e)
 
-    # Posta comentário consolidado na issue original
     comment = _build_origin_comment(
-        findings, user_reply, target_issues, fix_prs
+        findings, user_reply, target_issues, duplicates, fix_prs, metrics
     )
     try:
         comment_on_issue(REPORTS_REPO, number, comment)
     except Exception as e:
         log.error("Falha ao comentar na issue #%d: %s", number, e)
 
-    # Labels agregadas
-    add_labels = _aggregate_labels(findings, target_issues)
+    add_labels = _aggregate_labels(findings, target_issues, duplicates)
     try:
         add_issue_labels(REPORTS_REPO, number, add_labels)
     except Exception as e:
         log.error("Falha ao adicionar labels: %s", e)
 
-    # Fecha se ao menos 1 issue técnica foi criada
-    if target_issues:
+    should_close = (
+        bool(target_issues)
+        or bool(duplicates)
+        or any(_is_rejection(f) for f in findings)
+    )
+    if should_close:
+        reason = (
+            "not_planned"
+            if any(_is_rejection(f) for f in findings) and not target_issues
+            else "completed"
+        )
         try:
-            close_issue(REPORTS_REPO, number)
+            close_issue(REPORTS_REPO, number, reason=reason)
         except Exception as e:
             log.error("Falha ao fechar issue #%d: %s", number, e)
+
+    _emit_metrics_summary(number, title, metrics)
 
 
 def _target_title(kind: str, finding: dict, origin_title: str) -> str:
@@ -704,29 +851,38 @@ def _target_title(kind: str, finding: dict, origin_title: str) -> str:
     return f"{prefix} {summary}"
 
 
-def _aggregate_labels(findings: list[dict], target_issues: list[tuple]) -> list[str]:
+def _aggregate_labels(
+    findings: list[dict],
+    target_issues: list[tuple],
+    duplicates: list[tuple],
+) -> list[str]:
     labels: list[str] = [TRIAGED_LABEL]
     seen: set[str] = set()
-
-    actionable_findings = [f for f in findings if _is_actionable(f)]
 
     for f in findings:
         kind = f.get("kind", "unclear")
         conf = float(f.get("confidence") or 0)
-        if conf < UNDEFINED_CONFIDENCE_THRESHOLD:
+        if kind == "rejected":
+            if conf < REJECTION_CONFIDENCE_THRESHOLD:
+                continue
+        elif conf < UNDEFINED_CONFIDENCE_THRESHOLD:
             continue
         kind_label = KIND_TO_ORIGIN_LABELS.get(kind)
         if kind_label and kind_label not in seen:
             seen.add(kind_label)
             labels.append(kind_label)
 
-    for f in actionable_findings:
+    actionable = [f for f in findings if _is_actionable(f)]
+    for f in actionable:
         repo = f.get("target_repo")
         if repo:
             tag = f"repo:{repo}"
             if tag not in seen:
                 seen.add(tag)
                 labels.append(tag)
+
+    if duplicates:
+        labels.append("duplicate-of-known")
 
     if any(_is_auto_fix_eligible(f) for f in findings):
         labels.append("auto-fix-eligible")
@@ -767,23 +923,42 @@ def _build_target_issue_body(origin: dict, finding: dict) -> str:
     )
 
 
+def _build_duplicate_comment(origin: dict, finding: dict) -> str:
+    return (
+        f"+1 — outro usuário relatou problema similar em "
+        f"{origin.get('html_url', '?')}.\n\n"
+        f"**Resumo do novo relato:** {finding.get('summary', '')}\n\n"
+        f"_Vinculado automaticamente pelo Triage Pipeline (dedup semântica)._"
+    )
+
+
 def _build_origin_comment(
     findings: list[dict],
     user_reply: str,
     target_issues: list[tuple],
+    duplicates: list[tuple],
     fix_prs: list[tuple],
+    metrics: dict,
 ) -> str:
     actionable = [f for f in findings if _is_actionable(f)]
+    rejections = [f for f in findings if _is_rejection(f)]
 
     KIND_LABEL = {
         "bug": "BUG",
         "improvement": "MELHORIA",
         "question": "PERGUNTA",
         "unclear": "NÃO CLASSIFICADO",
+        "rejected": "REJEITADO",
     }
 
     if not findings:
         header = "**Análise inconclusiva**"
+    elif rejections and not actionable:
+        if len(rejections) == 1:
+            f = rejections[0]
+            header = f"**Report REJEITADO** (confiança {float(f['confidence']):.0%})"
+        else:
+            header = f"**{len(rejections)} pontos rejeitados**"
     elif len(actionable) == 0:
         kinds = sorted({f.get("kind", "unclear") for f in findings})
         if kinds == ["question"]:
@@ -822,6 +997,16 @@ def _build_origin_comment(
                     f"- `{finding.get('target_repo', '?')}` ({kind_label}): {ti.get('html_url', '?')}"
                 )
 
+    if duplicates:
+        parts.append("")
+        if len(duplicates) == 1:
+            finding, dup = duplicates[0]
+            parts.append(f"Duplicata de issue existente: {dup.get('html_url', '?')}")
+        else:
+            parts.append("Duplicatas de issues existentes:")
+            for finding, dup in duplicates:
+                parts.append(f"- `{finding.get('target_repo', '?')}`: {dup.get('html_url', '?')}")
+
     if fix_prs:
         parts.append("")
         if len(fix_prs) == 1:
@@ -834,7 +1019,39 @@ def _build_origin_comment(
             for finding, pr_url in fix_prs:
                 parts.append(f"- `{finding.get('target_repo', '?')}`: {pr_url}")
 
+    parts.append("")
+    parts.append(
+        f"_**Custo desta resolução:** ${metrics['cost_usd']:.4f} em "
+        f"{metrics['calls']} chamada(s) Claude / {metrics['turns']} turn(s) / "
+        f"{metrics['duration_s']:.1f}s._"
+    )
+
     return "\n".join(parts).strip()
+
+
+def _emit_metrics_summary(issue_number: int, title: str, metrics: dict) -> None:
+    msg = (
+        f"Issue #{issue_number}: ${metrics['cost_usd']:.4f} em "
+        f"{metrics['calls']} call(s) / {metrics['turns']} turns / "
+        f"{metrics['duration_s']:.1f}s — {title[:60]}"
+    )
+    log.info("=== RESOLUÇÃO ===  %s", msg)
+    print(f"::notice title=Resolução issue #{issue_number}::{msg}")
+
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if step_summary:
+        try:
+            with open(step_summary, "a") as f:
+                f.write(
+                    f"| #{issue_number} | "
+                    f"${metrics['cost_usd']:.4f} | "
+                    f"{metrics['calls']} | "
+                    f"{metrics['turns']} | "
+                    f"{metrics['duration_s']:.1f}s | "
+                    f"{title[:60]} |\n"
+                )
+        except Exception as e:
+            log.debug("Não consegui gravar GITHUB_STEP_SUMMARY: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -843,9 +1060,19 @@ def _build_origin_comment(
 
 
 def main() -> None:
-    log.info("=== Triage Pipeline (MCP + kind-aware + auto-fix) ===")
+    log.info("=== Triage Pipeline (MCP + kind-aware + auto-fix + dedup + métricas) ===")
     log.info("Reports repo: %s", REPORTS_REPO)
     log.info("Repos-alvo: %s", ", ".join(TARGET_REPOS))
+
+    step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+    if step_summary:
+        try:
+            with open(step_summary, "a") as f:
+                f.write("## Custo por resolução\n\n")
+                f.write("| Issue | Custo | Calls | Turns | Tempo | Título |\n")
+                f.write("|---|---|---|---|---|---|\n")
+        except Exception:
+            pass
 
     issues: list[dict]
     if TRIGGERING_ISSUE and not FORCE_ALL:

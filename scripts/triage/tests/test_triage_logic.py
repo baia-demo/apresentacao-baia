@@ -73,7 +73,8 @@ class TestAggregateLabels(unittest.TestCase):
     def test_um_bug_high_confidence_aplica_is_bug_e_repo(self):
         labels = _aggregate_labels(
             [make_finding(kind="bug", target_repo="orders-api")],
-            target_issues=[(make_finding(target_repo="orders-api"), "u")],
+            target_issues=[(make_finding(target_repo="orders-api"), {"html_url": "u"})],
+            duplicates=[],
         )
         self.assertIn("triaged", labels)
         self.assertIn("is-bug", labels)
@@ -83,8 +84,9 @@ class TestAggregateLabels(unittest.TestCase):
         labels = _aggregate_labels(
             [make_finding(kind="improvement", target_repo="storefront-web")],
             target_issues=[
-                (make_finding(target_repo="storefront-web"), "u")
+                (make_finding(target_repo="storefront-web"), {"html_url": "u"})
             ],
+            duplicates=[],
         )
         self.assertIn("is-improvement", labels)
         self.assertNotIn("is-bug", labels)
@@ -99,6 +101,7 @@ class TestAggregateLabels(unittest.TestCase):
                 )
             ],
             target_issues=[],
+            duplicates=[],
         )
         self.assertIn("is-question", labels)
         self.assertFalse(any(l.startswith("repo:") for l in labels))
@@ -107,6 +110,7 @@ class TestAggregateLabels(unittest.TestCase):
         labels = _aggregate_labels(
             [make_finding(kind="bug", confidence=0.2)],
             target_issues=[],
+            duplicates=[],
         )
         self.assertIn("low-confidence", labels)
         self.assertNotIn("is-bug", labels)
@@ -116,8 +120,8 @@ class TestAggregateLabels(unittest.TestCase):
             make_finding(kind="bug", target_repo="catalog-api"),
             make_finding(kind="bug", target_repo="catalog-api"),
         ]
-        target_issues = [(f, f"url-{i}") for i, f in enumerate(findings)]
-        labels = _aggregate_labels(findings, target_issues)
+        target_issues = [(f, {"html_url": f"url-{i}"}) for i, f in enumerate(findings)]
+        labels = _aggregate_labels(findings, target_issues, duplicates=[])
         repo_labels = [l for l in labels if l.startswith("repo:")]
         self.assertEqual(repo_labels, ["repo:catalog-api"])
 
@@ -153,19 +157,26 @@ def make_target_issue(url: str = "https://gh/issue/3", number: int = 3) -> dict:
     return {"html_url": url, "number": number}
 
 
+def make_metrics(cost=0.05, calls=2, turns=5, duration=20.0):
+    return {"cost_usd": cost, "calls": calls, "turns": turns, "duration_s": duration}
+
+
 class TestBuildOriginComment(unittest.TestCase):
     def test_um_bug_single_findings(self):
         comment = _build_origin_comment(
             [make_finding(kind="bug", confidence=0.92)],
             user_reply="Olá, o bug é ...",
             target_issues=[(make_finding(target_repo="catalog-api"), make_target_issue())],
+            duplicates=[],
             fix_prs=[],
+            metrics=make_metrics(),
         )
         self.assertIn("Classificado como BUG", comment)
         self.assertIn("92%", comment)
         self.assertIn("https://gh/issue/3", comment)
         self.assertIn("Olá, o bug é", comment)
         self.assertNotIn("Auto-fix", comment)
+        self.assertIn("Custo desta resolução", comment)
 
     def test_multiplos_findings_enumera(self):
         findings = [
@@ -179,7 +190,9 @@ class TestBuildOriginComment(unittest.TestCase):
                 (findings[0], make_target_issue("url1")),
                 (findings[1], make_target_issue("url2")),
             ],
+            duplicates=[],
             fix_prs=[],
+            metrics=make_metrics(),
         )
         self.assertIn("2 pontos identificados", comment)
         self.assertIn("BUG: A", comment)
@@ -197,7 +210,9 @@ class TestBuildOriginComment(unittest.TestCase):
             ],
             user_reply="resposta",
             target_issues=[],
+            duplicates=[],
             fix_prs=[],
+            metrics=make_metrics(),
         )
         self.assertIn("pergunta", comment.lower())
         self.assertNotIn("Issue técnica:", comment)
@@ -208,10 +223,39 @@ class TestBuildOriginComment(unittest.TestCase):
             [finding],
             user_reply="resposta",
             target_issues=[(finding, make_target_issue())],
+            duplicates=[],
             fix_prs=[(finding, "https://gh/pull/7")],
+            metrics=make_metrics(),
         )
         self.assertIn("Auto-fix", comment)
         self.assertIn("https://gh/pull/7", comment)
+
+    def test_rejected_mostra_header_rejeitado(self):
+        finding = make_finding(kind="rejected", target_repo=None, confidence=0.85)
+        comment = _build_origin_comment(
+            [finding],
+            user_reply="Não vamos atender porque foge do escopo.",
+            target_issues=[],
+            duplicates=[],
+            fix_prs=[],
+            metrics=make_metrics(),
+        )
+        self.assertIn("REJEITADO", comment)
+        self.assertIn("escopo", comment)
+
+    def test_duplicate_mostra_link_existente(self):
+        finding = make_finding(kind="bug", target_repo="catalog-api", confidence=0.9)
+        dup_issue = make_target_issue("https://gh/issue/dup-99")
+        comment = _build_origin_comment(
+            [finding],
+            user_reply="já reportado",
+            target_issues=[],
+            duplicates=[(finding, dup_issue)],
+            fix_prs=[],
+            metrics=make_metrics(),
+        )
+        self.assertIn("Duplicata", comment)
+        self.assertIn("dup-99", comment)
 
 
 class TestAutoFixEligible(unittest.TestCase):
@@ -219,6 +263,7 @@ class TestAutoFixEligible(unittest.TestCase):
         labels = _aggregate_labels(
             [make_finding(kind="bug", confidence=0.95)],
             target_issues=[(make_finding(), {"html_url": "u"})],
+            duplicates=[],
         )
         self.assertIn("auto-fix-eligible", labels)
 
@@ -226,6 +271,7 @@ class TestAutoFixEligible(unittest.TestCase):
         labels = _aggregate_labels(
             [make_finding(kind="bug", confidence=0.7)],
             target_issues=[(make_finding(), {"html_url": "u"})],
+            duplicates=[],
         )
         self.assertNotIn("auto-fix-eligible", labels)
 
@@ -233,8 +279,42 @@ class TestAutoFixEligible(unittest.TestCase):
         labels = _aggregate_labels(
             [make_finding(kind="question", target_repo=None, confidence=0.95)],
             target_issues=[],
+            duplicates=[],
         )
         self.assertNotIn("auto-fix-eligible", labels)
+
+
+class TestRejected(unittest.TestCase):
+    def test_rejected_alta_confianca_aplica_label(self):
+        from triage import _is_rejection
+        labels = _aggregate_labels(
+            [make_finding(kind="rejected", target_repo=None, confidence=0.85)],
+            target_issues=[],
+            duplicates=[],
+        )
+        self.assertIn("rejected", labels)
+        self.assertNotIn("is-bug", labels)
+        self.assertTrue(_is_rejection(make_finding(kind="rejected", target_repo=None, confidence=0.85)))
+
+    def test_rejected_baixa_confianca_nao_rejeita(self):
+        from triage import _is_rejection
+        finding = make_finding(kind="rejected", target_repo=None, confidence=0.5)
+        self.assertFalse(_is_rejection(finding))
+
+    def test_rejected_nao_eh_actionable(self):
+        from triage import _is_actionable
+        finding = make_finding(kind="rejected", target_repo=None, confidence=0.95)
+        self.assertFalse(_is_actionable(finding))
+
+
+class TestDuplicateLabel(unittest.TestCase):
+    def test_duplicates_adicionam_label(self):
+        labels = _aggregate_labels(
+            [make_finding(kind="bug", confidence=0.9)],
+            target_issues=[],
+            duplicates=[(make_finding(), {"html_url": "u", "number": 5})],
+        )
+        self.assertIn("duplicate-of-known", labels)
 
 
 if __name__ == "__main__":

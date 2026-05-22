@@ -25,7 +25,7 @@ VALID_REPOS = [
 ]
 OUTPUT_FILE = Path(os.environ.get("TRIAGE_OUTPUT_FILE", "/tmp/triage_result.json"))
 
-FindingKind = Literal["bug", "improvement", "question", "unclear"]
+FindingKind = Literal["bug", "improvement", "question", "unclear", "rejected"]
 
 mcp = FastMCP("triage")
 
@@ -42,10 +42,12 @@ class Finding(BaseModel):
     kind: FindingKind = Field(
         description=(
             "Tipo do report: "
-            "'bug' (defeito real no código); "
-            "'improvement' (sugestão de feature/UX, comportamento atual está OK); "
-            "'question' (usuário fazendo pergunta, sem reportar problema); "
-            "'unclear' (não dá pra entender o que ele quer dizer)."
+            "'bug' (defeito real em código de e-commerce); "
+            "'improvement' (sugestão coerente com a proposta do produto); "
+            "'question' (pergunta, sem reportar problema); "
+            "'unclear' (texto vago); "
+            "'rejected' (abusivo, fora de escopo, destrutivo ou mudança "
+            "estrutural que descaracteriza o produto)."
         )
     )
     confidence: float = Field(
@@ -105,7 +107,7 @@ def submit_triage(
                 f"findings[{i}]: kind='{f.kind}' requer target_repo definido."
             )
         if (
-            f.kind in ("question", "unclear")
+            f.kind in ("question", "unclear", "rejected")
             and f.target_repo
         ):
             raise ValueError(
