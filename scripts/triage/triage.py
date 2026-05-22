@@ -296,10 +296,10 @@ def close_issue(repo: str, number: int, reason: str = "completed") -> None:
 # ---------------------------------------------------------------------------
 
 
-_anthropic_client: Anthropic | None = None
+_anthropic_client = None  # type: ignore[var-annotated]
 
 
-def _anthropic() -> Anthropic | None:
+def _anthropic():
     """Lazy singleton do client Anthropic. Retorna None se SDK não instalado."""
     global _anthropic_client
     if _anthropic_client is None and Anthropic is not None:
