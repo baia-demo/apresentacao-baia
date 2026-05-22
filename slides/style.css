@@ -19,3 +19,23 @@ a {
 .slidev-layout blockquote {
   border-left: 4px solid #0A9F82;
 }
+
+/* Esconde TODA a navegação/controles do Slidev */
+#slidev-nav-controls,
+.slidev-nav,
+.slidev-controls,
+.slidev-nav-controls,
+.slidev-page-info,
+.slidev-page-arrow,
+.slidev-progress,
+[class*="nav-controls"],
+[class*="slidev-controls"] {
+  display: none !important;
+}
+
+/* Esconde qualquer barra/container fixado no bottom da janela */
+body > .fixed.bottom-0,
+body > div > .fixed.bottom-0,
+.slidev-controls-wrapper {
+  display: none !important;
+}
