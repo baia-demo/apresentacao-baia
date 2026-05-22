@@ -1,5 +1,5 @@
 """
-Bug Triage Automático via GitHub Issues + Claude Code Headless.
+Bug Triage Automático via GitHub Issues + Claude Code Headless + MCP tool.
 
 Demo da palestra "Triagem Autônoma de Bugs com Claude Code Headless" (BaIA).
 
@@ -8,15 +8,14 @@ O usuário reporta um bug pelo form web da ShopFlow, que abre uma issue em
 pelo GitHub Actions e:
 
   1. Lê o título e corpo da issue
-  2. Clona os repositórios da arquitetura (shallow)
-  3. Dispara Claude Code em modo headless (read-only)
-  4. Recebe um JSON com veredito + confiança + repo + análise
-  5. Se for bug: cria issue no repo correto e linka na issue original
-  6. Atualiza labels, comenta na issue original e fecha
-
-Modos:
-  - Disparo por evento (`issues.labeled`): processa apenas a issue do evento
-  - `workflow_dispatch`: processa todas as issues abertas com label de triagem
+  2. Remove a label `needs-triage` atomicamente (idempotência)
+  3. Clona os repositórios da arquitetura (shallow)
+  4. Dispara Claude Code em modo headless (read-only), conectado a um
+     MCP server local que expõe a tool `submit_triage`
+  5. Lê o veredito do arquivo JSON gravado pelo MCP server (output estruturado
+     com validação de schema dentro da tool — não dependemos de JSON livre)
+  6. Se for bug com confiança >= 0.5: cria issue no repo correto + comenta + fecha
+  7. Senão: comenta na issue original + atualiza labels
 """
 
 import json
@@ -29,13 +28,13 @@ import urllib.parse
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Config (tudo via env — ver README.md)
+# Config
 # ---------------------------------------------------------------------------
 
 GH_PAT = os.environ["GH_PAT"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 GITHUB_ORG = os.environ["GITHUB_ORG"]
-REPORTS_REPO = os.environ["REPORTS_REPO"]              # ex: baia-demo/bug-reports
+REPORTS_REPO = os.environ["REPORTS_REPO"]
 TARGET_REPOS = [
     r.strip()
     for r in os.environ["TARGET_REPOS"].split(",")
@@ -52,10 +51,16 @@ TRIGGERING_ISSUE = (
     else None
 )
 FORCE_ALL = os.environ.get("FORCE_ALL", "false").lower() == "true"
-MAX_ISSUES = int(os.environ.get("MAX_ISSUES", "0"))     # 0 = sem limite
+MAX_ISSUES = int(os.environ.get("MAX_ISSUES", "0"))
 
-CLAUDE_TRIAGE_MD = Path(__file__).parent / "CLAUDE_TRIAGE.md"
-CLAUDE_TIMEOUT = 480  # 8 min por issue
+SCRIPT_DIR = Path(__file__).parent
+CLAUDE_TRIAGE_MD = SCRIPT_DIR / "CLAUDE_TRIAGE.md"
+MCP_SERVER_SCRIPT = SCRIPT_DIR / "triage_mcp_server.py"
+TRIAGE_OUTPUT_FILE = Path("/tmp/triage_result.json")
+MCP_CONFIG_FILE = Path("/tmp/triage_mcp_config.json")
+CLAUDE_TIMEOUT = 480
+
+UNDEFINED_CONFIDENCE_THRESHOLD = 0.5
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,7 +79,7 @@ def _github_request(
     path: str,
     body: dict | None = None,
     params: dict | None = None,
-) -> dict | list:
+) -> dict | list | None:
     url = f"https://api.github.com{path}"
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -87,12 +92,9 @@ def _github_request(
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode() or "null")
-    except urllib.error.HTTPError as e:
-        log.error("GitHub API %s %s falhou (%s): %s", method, path, e.code, e.read().decode()[:500])
-        raise
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read().decode()
+        return json.loads(raw) if raw else None
 
 
 def get_issue(repo: str, number: int) -> dict:
@@ -124,12 +126,27 @@ def comment_on_issue(repo: str, number: int, body: str) -> None:
     )
 
 
-def replace_issue_labels(repo: str, number: int, labels: list[str]) -> None:
+def add_issue_labels(repo: str, number: int, labels: list[str]) -> None:
     _github_request(
-        "PUT",
+        "POST",
         f"/repos/{repo}/issues/{number}/labels",
         body={"labels": labels},
     )
+
+
+def remove_issue_label_atomic(repo: str, number: int, label: str) -> bool:
+    """Remove uma label específica. Retorna False se já não estava lá.
+
+    Usado pra idempotência — primeiro a remover ganha o processamento.
+    """
+    quoted = urllib.parse.quote(label, safe="")
+    try:
+        _github_request("DELETE", f"/repos/{repo}/issues/{number}/labels/{quoted}")
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
 
 
 def close_issue(repo: str, number: int) -> None:
@@ -141,8 +158,26 @@ def close_issue(repo: str, number: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Claude Code headless
+# MCP config + Claude Code headless
 # ---------------------------------------------------------------------------
+
+
+def _write_mcp_config() -> Path:
+    """Cria o arquivo de config MCP que o Claude Code lê pra spawnar o server."""
+    config = {
+        "mcpServers": {
+            "triage": {
+                "command": "python3",
+                "args": [str(MCP_SERVER_SCRIPT)],
+                "env": {
+                    "VALID_REPOS": ",".join(TARGET_REPOS),
+                    "TRIAGE_OUTPUT_FILE": str(TRIAGE_OUTPUT_FILE),
+                },
+            }
+        }
+    }
+    MCP_CONFIG_FILE.write_text(json.dumps(config))
+    return MCP_CONFIG_FILE
 
 
 def run_claude_triage(title: str, body: str) -> dict:
@@ -161,8 +196,13 @@ def run_claude_triage(title: str, body: str) -> dict:
 
 ---
 
-Analise o bug acima navegando pelos repositórios em ./repos/ e responda com o JSON especificado.
+Analise o bug acima navegando pelos repositórios em ./repos/. Quando tiver
+o veredito, chame a tool `submit_triage` (UMA vez) e encerre.
 """
+
+    # Limpa output anterior pra detectar se a tool foi chamada nesta run
+    TRIAGE_OUTPUT_FILE.unlink(missing_ok=True)
+    mcp_config = _write_mcp_config()
 
     try:
         result = subprocess.run(
@@ -172,7 +212,9 @@ Analise o bug acima navegando pelos repositórios em ./repos/ e responda com o J
                 "--output-format", "json",
                 "--max-turns", "25",
                 "--model", "claude-sonnet-4-6",
-                "--allowedTools", "Read,Glob,Grep,LS",
+                "--mcp-config", str(mcp_config),
+                "--allowedTools",
+                "Read,Glob,Grep,LS,mcp__triage__submit_triage",
             ],
             capture_output=True,
             text=True,
@@ -182,136 +224,46 @@ Analise o bug acima navegando pelos repositórios em ./repos/ e responda com o J
         )
     except subprocess.TimeoutExpired:
         log.error("Claude Code timeout após %ds", CLAUDE_TIMEOUT)
-        return _fallback_result(title, "Timeout na análise — bug complexo demais.")
+        return _fallback_result(title, "Timeout na análise.")
 
+    # Log de métricas
     try:
         outer = json.loads(result.stdout)
-        cost = outer.get("total_cost_usd", 0)
-        turns = outer.get("num_turns", 0)
-        duration = outer.get("duration_ms", 0) / 1000
-        log.info("Claude Code: %d turns, %.1fs, $%.4f", turns, duration, cost)
+        log.info(
+            "Claude Code: %d turns, %.1fs, $%.4f",
+            outer.get("num_turns", 0),
+            outer.get("duration_ms", 0) / 1000,
+            outer.get("total_cost_usd", 0),
+        )
     except (json.JSONDecodeError, TypeError):
         pass
 
     if result.returncode != 0:
         log.error("Claude Code rc=%d stderr: %s", result.returncode, result.stderr[:500])
+
+    if not TRIAGE_OUTPUT_FILE.exists():
+        log.warning(
+            "submit_triage NÃO foi chamada. Claude stdout: %s",
+            result.stdout[:500],
+        )
         return _fallback_result(
             title,
-            f"Erro na execução do Claude Code: {result.stderr[:200] or result.stdout[:200]}",
+            "Claude Code não chamou a tool submit_triage. "
+            "Provavelmente estourou turns ou abandonou a análise.",
         )
 
-    return _parse_claude_output(result.stdout, title)
-
-
-def _resume_for_json(session_id: str) -> str:
-    """Retoma uma sessão pedindo apenas o JSON final."""
     try:
-        result = subprocess.run(
-            [
-                "claude",
-                "-p",
-                "Pare de explorar. Retorne AGORA o JSON da triagem com os campos: "
-                "is_bug, confidence, target_repo, files_analyzed, summary, "
-                "explanation, suggested_fix, user_reply. Baseie-se no que já analisou.",
-                "--output-format", "json",
-                "--max-turns", "3",
-                "--model", "claude-sonnet-4-6",
-                "--resume", session_id,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            cwd=str(Path.cwd()),
-            env={**os.environ, "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY},
-        )
-        if result.returncode == 0:
-            outer = json.loads(result.stdout)
-            return outer.get("result", "")
-    except Exception as e:
-        log.warning("Falha ao resumir sessão: %s", e)
-    return ""
-
-
-def _try_parse(response_text: str) -> dict | None:
-    """Tenta extrair e validar o JSON do output. Retorna o dict ou None."""
-    json_str = _extract_json(response_text)
-    if not json_str:
-        return None
-    try:
-        parsed = json.loads(json_str)
-    except json.JSONDecodeError:
-        return None
-
-    required = ["is_bug", "confidence", "target_repo", "summary", "user_reply"]
-    if not all(k in parsed for k in required):
-        return None
-
-    raw_repo = parsed.get("target_repo")
-    if raw_repo:
-        normalized = str(raw_repo).strip().lower().split("/")[-1]
-        if normalized in TARGET_REPOS:
-            parsed["target_repo"] = normalized
-        elif raw_repo not in TARGET_REPOS:
-            log.warning(
-                "target_repo inválido '%s', fallback: %s",
-                raw_repo,
-                TARGET_REPOS[0],
-            )
-            parsed["target_repo"] = TARGET_REPOS[0]
-    return parsed
-
-
-def _parse_claude_output(raw_output: str, title: str) -> dict:
-    session_id = ""
-    subtype = ""
-    try:
-        outer = json.loads(raw_output)
-        subtype = outer.get("subtype", "")
-        session_id = outer.get("session_id", "")
-        response_text = outer.get("result", "")
-    except (json.JSONDecodeError, TypeError):
-        response_text = raw_output
-
-    parsed = _try_parse(response_text) if response_text else None
-    if parsed:
-        return parsed
-
-    # Primeira tentativa falhou — tenta resumir a sessão pedindo só o JSON.
-    # Cobre tanto max_turns (sem result) quanto JSON malformado/cortado.
-    if session_id:
+        data = json.loads(TRIAGE_OUTPUT_FILE.read_text())
         log.info(
-            "Parse falhou (subtype=%s, len=%d). Resumindo sessão para JSON limpo...",
-            subtype,
-            len(response_text or ""),
+            "Veredito recebido via MCP: is_bug=%s confidence=%.2f target=%s",
+            data.get("is_bug"),
+            data.get("confidence", 0.0),
+            data.get("target_repo"),
         )
-        resumed = _resume_for_json(session_id)
-        parsed = _try_parse(resumed) if resumed else None
-        if parsed:
-            return parsed
-        log.warning("Resume também não retornou JSON válido. preview: %s", (resumed or "")[:300])
-
-    log.warning("Não foi possível parsear output. preview: %s", (response_text or "")[:500])
-    return _fallback_result(title, f"Análise inconclusiva: {(response_text or '')[:500]}")
-
-
-def _extract_json(text: str) -> str | None:
-    stripped = text.strip()
-    if stripped.startswith("{"):
-        return stripped
-
-    for marker in ["```json\n", "```\n"]:
-        if marker in text:
-            start = text.index(marker) + len(marker)
-            end = text.find("```", start)
-            if end != -1:
-                return text[start:end].strip()
-
-    first = text.find("{")
-    last = text.rfind("}")
-    if first != -1 and last != -1 and last > first:
-        return text[first : last + 1]
-
-    return None
+        return data
+    except (json.JSONDecodeError, OSError) as e:
+        log.error("Falha lendo output MCP: %s", e)
+        return _fallback_result(title, f"Output MCP inválido: {e}")
 
 
 def _fallback_result(title: str, reason: str) -> dict:
@@ -324,8 +276,8 @@ def _fallback_result(title: str, reason: str) -> dict:
         "explanation": reason,
         "suggested_fix": None,
         "user_reply": (
-            f"Não consegui analisar este bug automaticamente. Motivo: {reason[:200]}. "
-            "Vai precisar de uma olhada manual."
+            f"Não consegui analisar este bug automaticamente. Motivo: "
+            f"{reason[:200]}. Vai precisar de uma olhada manual."
         ),
     }
 
@@ -335,13 +287,20 @@ def _fallback_result(title: str, reason: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-UNDEFINED_CONFIDENCE_THRESHOLD = 0.5
-
-
 def process_issue(issue: dict) -> None:
     title = issue.get("title", "(sem título)")
     body = issue.get("body") or "(sem descrição)"
     number = issue["number"]
+
+    # Idempotência: primeiro a remover a label ganha o processamento.
+    # Se já foi removida (outro runner / re-trigger), abortamos sem efeitos.
+    if not remove_issue_label_atomic(REPORTS_REPO, number, TRIAGE_LABEL):
+        log.info(
+            "Issue #%d: label %s já removida — outro runner processou. Skip.",
+            number,
+            TRIAGE_LABEL,
+        )
+        return
 
     log.info("=== Processando issue #%d: %s ===", number, title)
 
@@ -372,20 +331,20 @@ def process_issue(issue: dict) -> None:
     except Exception as e:
         log.error("Falha ao comentar na issue #%d: %s", number, e)
 
-    labels = [TRIAGED_LABEL]
+    add_labels = [TRIAGED_LABEL]
     if confidence < UNDEFINED_CONFIDENCE_THRESHOLD:
-        labels.append("low-confidence")
+        add_labels.append("low-confidence")
     elif is_bug:
-        labels.append(IS_BUG_LABEL)
+        add_labels.append(IS_BUG_LABEL)
         if target_repo:
-            labels.append(f"repo:{target_repo}")
+            add_labels.append(f"repo:{target_repo}")
     else:
-        labels.append(NOT_BUG_LABEL)
+        add_labels.append(NOT_BUG_LABEL)
 
     try:
-        replace_issue_labels(REPORTS_REPO, number, labels)
+        add_issue_labels(REPORTS_REPO, number, add_labels)
     except Exception as e:
-        log.error("Falha ao atualizar labels: %s", e)
+        log.error("Falha ao adicionar labels: %s", e)
 
     if target_issue_url:
         try:
@@ -440,7 +399,7 @@ def _build_origin_comment(result: dict, target_issue_url: str | None) -> str:
 
 
 def main() -> None:
-    log.info("=== Bug Triage Pipeline ===")
+    log.info("=== Bug Triage Pipeline (MCP) ===")
     log.info("Reports repo: %s", REPORTS_REPO)
     log.info("Repos-alvo: %s", ", ".join(TARGET_REPOS))
 
