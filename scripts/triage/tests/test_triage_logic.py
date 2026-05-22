@@ -149,17 +149,23 @@ class TestTargetTitle(unittest.TestCase):
         self.assertIn("Título original", title)
 
 
+def make_target_issue(url: str = "https://gh/issue/3", number: int = 3) -> dict:
+    return {"html_url": url, "number": number}
+
+
 class TestBuildOriginComment(unittest.TestCase):
     def test_um_bug_single_findings(self):
         comment = _build_origin_comment(
             [make_finding(kind="bug", confidence=0.92)],
             user_reply="Olá, o bug é ...",
-            target_issues=[(make_finding(target_repo="catalog-api"), "https://gh/issue/3")],
+            target_issues=[(make_finding(target_repo="catalog-api"), make_target_issue())],
+            fix_prs=[],
         )
         self.assertIn("Classificado como BUG", comment)
         self.assertIn("92%", comment)
         self.assertIn("https://gh/issue/3", comment)
         self.assertIn("Olá, o bug é", comment)
+        self.assertNotIn("Auto-fix", comment)
 
     def test_multiplos_findings_enumera(self):
         findings = [
@@ -169,7 +175,11 @@ class TestBuildOriginComment(unittest.TestCase):
         comment = _build_origin_comment(
             findings,
             user_reply="resposta",
-            target_issues=[(findings[0], "url1"), (findings[1], "url2")],
+            target_issues=[
+                (findings[0], make_target_issue("url1")),
+                (findings[1], make_target_issue("url2")),
+            ],
+            fix_prs=[],
         )
         self.assertIn("2 pontos identificados", comment)
         self.assertIn("BUG: A", comment)
@@ -187,9 +197,44 @@ class TestBuildOriginComment(unittest.TestCase):
             ],
             user_reply="resposta",
             target_issues=[],
+            fix_prs=[],
         )
         self.assertIn("pergunta", comment.lower())
         self.assertNotIn("Issue técnica:", comment)
+
+    def test_inclui_pr_url_quando_fix_prs(self):
+        finding = make_finding(kind="bug", target_repo="catalog-api", confidence=0.95)
+        comment = _build_origin_comment(
+            [finding],
+            user_reply="resposta",
+            target_issues=[(finding, make_target_issue())],
+            fix_prs=[(finding, "https://gh/pull/7")],
+        )
+        self.assertIn("Auto-fix", comment)
+        self.assertIn("https://gh/pull/7", comment)
+
+
+class TestAutoFixEligible(unittest.TestCase):
+    def test_alta_confianca_adiciona_label_auto_fix(self):
+        labels = _aggregate_labels(
+            [make_finding(kind="bug", confidence=0.95)],
+            target_issues=[(make_finding(), {"html_url": "u"})],
+        )
+        self.assertIn("auto-fix-eligible", labels)
+
+    def test_baixa_confianca_nao_adiciona_auto_fix(self):
+        labels = _aggregate_labels(
+            [make_finding(kind="bug", confidence=0.7)],
+            target_issues=[(make_finding(), {"html_url": "u"})],
+        )
+        self.assertNotIn("auto-fix-eligible", labels)
+
+    def test_question_nunca_eh_auto_fix(self):
+        labels = _aggregate_labels(
+            [make_finding(kind="question", target_repo=None, confidence=0.95)],
+            target_issues=[],
+        )
+        self.assertNotIn("auto-fix-eligible", labels)
 
 
 if __name__ == "__main__":

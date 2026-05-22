@@ -8,12 +8,18 @@ Cada finding tem um `kind` (bug/improvement/question/unclear). Bugs e
 improvements com confiança >= 0.5 viram issues técnicas no repo certo
 (labels diferentes — `bug` vs `enhancement`). Questions e unclear ficam
 só no comentário.
+
+Auto-fix: pra findings com kind bug/improvement E confidence >= 0.9, o
+agente re-executa Claude no clone do repo-alvo (desta vez com permissão
+de Edit/Write/Bash), aplica o fix, commita, abre PR. O ci.yml do repo
+alvo cuida de test + preview deploy + smoke + auto-merge.
 """
 
 import json
 import logging
 import os
 import subprocess
+import time
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -49,9 +55,14 @@ CLAUDE_TRIAGE_MD = SCRIPT_DIR / "CLAUDE_TRIAGE.md"
 MCP_SERVER_SCRIPT = SCRIPT_DIR / "triage_mcp_server.py"
 TRIAGE_OUTPUT_FILE = Path("/tmp/triage_result.json")
 MCP_CONFIG_FILE = Path("/tmp/triage_mcp_config.json")
+REPOS_DIR = Path("repos")
 CLAUDE_TIMEOUT = 480
+CLAUDE_FIX_TIMEOUT = 600
 
 UNDEFINED_CONFIDENCE_THRESHOLD = 0.5
+AUTO_FIX_CONFIDENCE_THRESHOLD = 0.9
+AUTO_FIX_BRANCH_PREFIX = "auto-fix/"
+AUTO_FIX_KINDS = {"bug", "improvement"}
 
 # Labels aplicadas no repo de target por kind
 KIND_TO_TARGET_LABELS = {
@@ -123,6 +134,86 @@ def create_issue(repo: str, title: str, body: str, labels: list[str]) -> dict:
     )  # type: ignore[return-value]
 
 
+def create_pull_request(
+    repo: str, title: str, head: str, base: str, body: str
+) -> dict:
+    return _github_request(
+        "POST",
+        f"/repos/{repo}/pulls",
+        body={"title": title, "head": head, "base": base, "body": body},
+    )  # type: ignore[return-value]
+
+
+def wait_for_pr_checks(repo: str, pr_number: int, timeout: int = 900) -> bool:
+    """Espera os checks da PR completarem. Retorna True se todos passaram."""
+    start = time.time()
+    last_state: list[str] = []
+    while time.time() - start < timeout:
+        try:
+            pr = _github_request("GET", f"/repos/{repo}/pulls/{pr_number}")
+            sha = pr["head"]["sha"]  # type: ignore[index]
+            runs_data = _github_request(
+                "GET", f"/repos/{repo}/commits/{sha}/check-runs"
+            )
+            check_runs = runs_data.get("check_runs", [])  # type: ignore[union-attr]
+        except Exception as e:
+            log.warning("Falha consultando PR/checks: %s", e)
+            time.sleep(15)
+            continue
+
+        if not check_runs:
+            log.info("PR #%d: nenhum check ainda; aguardando...", pr_number)
+            time.sleep(15)
+            continue
+
+        current = sorted(
+            f"{r['name']}={r['status']}/{r.get('conclusion', '?')}"
+            for r in check_runs
+        )
+        if current != last_state:
+            log.info("PR #%d checks: %s", pr_number, ", ".join(current))
+            last_state = current
+
+        all_done = all(r["status"] == "completed" for r in check_runs)
+        if not all_done:
+            time.sleep(15)
+            continue
+
+        ok_outcomes = {"success", "skipped", "neutral"}
+        failed = [r["name"] for r in check_runs if r.get("conclusion") not in ok_outcomes]
+        if failed:
+            log.warning("PR #%d: checks falharam: %s", pr_number, failed)
+            return False
+        return True
+
+    log.error("PR #%d: timeout esperando checks após %ds", pr_number, timeout)
+    return False
+
+
+def merge_pr(repo: str, pr_number: int) -> bool:
+    """Faz squash merge via API. Retorna True se mergeou."""
+    try:
+        result = _github_request(
+            "PUT",
+            f"/repos/{repo}/pulls/{pr_number}/merge",
+            body={"merge_method": "squash"},
+        )
+        if not result or not result.get("merged"):  # type: ignore[union-attr]
+            log.warning("Merge API não confirmou: %s", result)
+            return False
+        # Best-effort: deleta branch
+        try:
+            pr = _github_request("GET", f"/repos/{repo}/pulls/{pr_number}")
+            branch = pr["head"]["ref"]  # type: ignore[index]
+            _github_request("DELETE", f"/repos/{repo}/git/refs/heads/{branch}")
+        except Exception as e:
+            log.debug("Falha deletando branch (não-crítico): %s", e)
+        return True
+    except Exception as e:
+        log.error("Merge falhou: %s", e)
+        return False
+
+
 def comment_on_issue(repo: str, number: int, body: str) -> None:
     _github_request(
         "POST",
@@ -159,7 +250,7 @@ def close_issue(repo: str, number: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# MCP config + Claude Code headless
+# MCP config + Claude Code headless (triagem)
 # ---------------------------------------------------------------------------
 
 
@@ -230,7 +321,7 @@ chame `submit_triage` UMA vez com os findings e o user_reply, depois encerre.
     try:
         outer = json.loads(result.stdout)
         log.info(
-            "Claude Code: %d turns, %.1fs, $%.4f",
+            "Claude triagem: %d turns, %.1fs, $%.4f",
             outer.get("num_turns", 0),
             outer.get("duration_ms", 0) / 1000,
             outer.get("total_cost_usd", 0),
@@ -239,7 +330,7 @@ chame `submit_triage` UMA vez com os findings e o user_reply, depois encerre.
         pass
 
     if result.returncode != 0:
-        log.error("Claude Code rc=%d stderr: %s", result.returncode, result.stderr[:500])
+        log.error("Claude triagem rc=%d stderr: %s", result.returncode, result.stderr[:500])
 
     if not TRIAGE_OUTPUT_FILE.exists():
         log.warning(
@@ -291,18 +382,230 @@ def _fallback_result(title: str, reason: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Auto-fix (Claude Code com Edit/Write/Bash no repo-alvo)
+# ---------------------------------------------------------------------------
+
+
+def _run(cmd: list[str], cwd: str | Path, **kwargs) -> subprocess.CompletedProcess:
+    """Wrapper de subprocess.run que loga e levanta em rc != 0."""
+    log.debug("$ %s (cwd=%s)", " ".join(cmd), cwd)
+    return subprocess.run(cmd, cwd=str(cwd), check=True, **kwargs)
+
+
+def run_auto_fix(finding: dict, origin_issue: dict, target_issue: dict) -> str | None:
+    """Aplica fix automático no repo-alvo, abre PR. Retorna URL da PR ou None."""
+    repo = finding["target_repo"]
+    work_dir = REPOS_DIR / repo
+    if not work_dir.exists():
+        log.error("Repo clonado não encontrado: %s", work_dir)
+        return None
+
+    branch = f"{AUTO_FIX_BRANCH_PREFIX}feedback-{origin_issue['number']}-{int(time.time())}"
+    log.info("Auto-fix em %s: branch %s", repo, branch)
+
+    try:
+        # Garante histórico completo + branch
+        try:
+            _run(["git", "fetch", "--unshallow"], cwd=work_dir,
+                 capture_output=True, text=True)
+        except subprocess.CalledProcessError:
+            pass  # já era full clone
+
+        _run(["git", "config", "user.email", "auto-fix-agent@baia-demo.dev"], cwd=work_dir)
+        _run(["git", "config", "user.name", "Auto-fix Agent (Claude)"], cwd=work_dir)
+        _run(["git", "checkout", "-b", branch], cwd=work_dir,
+             capture_output=True, text=True)
+
+        # Roda Claude com permissões de edição/escrita
+        fix_prompt = _build_fix_prompt(repo, origin_issue, target_issue, finding)
+        log.info("Executando Claude (fix mode) em %s...", work_dir)
+        result = subprocess.run(
+            [
+                "claude",
+                "-p", fix_prompt,
+                "--output-format", "json",
+                "--max-turns", "30",
+                "--model", "claude-sonnet-4-6",
+                "--allowedTools", "Read,Glob,Grep,LS,Edit,Write,Bash",
+            ],
+            cwd=str(work_dir),
+            capture_output=True,
+            text=True,
+            timeout=CLAUDE_FIX_TIMEOUT,
+            env={**os.environ, "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY},
+        )
+
+        try:
+            outer = json.loads(result.stdout)
+            log.info(
+                "Claude fix: %d turns, %.1fs, $%.4f",
+                outer.get("num_turns", 0),
+                outer.get("duration_ms", 0) / 1000,
+                outer.get("total_cost_usd", 0),
+            )
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        if result.returncode != 0:
+            log.error("Claude fix rc=%d stderr: %s", result.returncode, result.stderr[:500])
+            return None
+
+        # Confere se houve mudança
+        diff = subprocess.run(
+            ["git", "diff", "--stat"], cwd=str(work_dir),
+            capture_output=True, text=True,
+        )
+        if not diff.stdout.strip():
+            log.warning("Claude não fez mudanças no código — abortando PR")
+            return None
+
+        log.info("Diff:\n%s", diff.stdout[:1000])
+
+        _run(["git", "add", "-A"], cwd=work_dir)
+        commit_msg = _build_commit_message(finding, origin_issue, target_issue)
+        _run(["git", "commit", "-m", commit_msg], cwd=work_dir,
+             capture_output=True, text=True)
+
+        # Push usando o GH_PAT
+        push_url = f"https://x-access-token:{GH_PAT}@github.com/{GITHUB_ORG}/{repo}.git"
+        _run(["git", "push", push_url, f"HEAD:{branch}"], cwd=work_dir,
+             capture_output=True, text=True)
+
+        # Abre PR
+        pr = create_pull_request(
+            f"{GITHUB_ORG}/{repo}",
+            title=f"{_pr_title_prefix(finding)} {finding.get('summary', '')}"[:100],
+            head=branch,
+            base="main",
+            body=_build_pr_body(finding, origin_issue, target_issue),
+        )
+        pr_url = pr.get("html_url")
+        pr_number = pr.get("number")
+        log.info("PR aberta: %s", pr_url)
+
+        # Espera o ci.yml da PR (test + preview-deploy + preview-smoke) passar.
+        # Se passar, mergeia com squash via PAT (necessário pra que o ci.yml do
+        # main rode depois — GITHUB_TOKEN não dispara workflows downstream).
+        if pr_number:
+            log.info("Aguardando checks da PR #%s...", pr_number)
+            ok = wait_for_pr_checks(f"{GITHUB_ORG}/{repo}", pr_number, timeout=900)
+            if ok:
+                log.info("Checks verdes — mergeando PR #%s", pr_number)
+                merge_pr(f"{GITHUB_ORG}/{repo}", pr_number)
+            else:
+                log.warning("Checks falharam — PR fica aberta pra revisão manual")
+        return pr_url
+    except subprocess.CalledProcessError as e:
+        log.error("Comando falhou no auto-fix: %s | stderr=%s", e, e.stderr if hasattr(e, "stderr") else "")
+        return None
+    except subprocess.TimeoutExpired:
+        log.error("Claude fix timeout após %ds", CLAUDE_FIX_TIMEOUT)
+        return None
+    except Exception as e:
+        log.exception("Erro inesperado no auto-fix: %s", e)
+        return None
+
+
+def _build_fix_prompt(repo: str, origin: dict, target: dict, finding: dict) -> str:
+    suggested = finding.get("suggested_fix") or "(o agente de triagem não sugeriu fix específico)"
+    return f"""Você é um engenheiro corrigindo um bug/melhoria identificado pelo agente de triagem.
+
+**Repositório:** `{repo}` (você está dentro do clone)
+
+**Issue técnica:** #{target.get('number', '?')} — {target.get('title', '')}
+**Issue original do usuário:** {origin.get('html_url', '?')}
+
+**Diagnóstico do agente de triagem:**
+
+- Tipo: `{finding.get('kind')}`
+- Resumo: {finding.get('summary', '')}
+- Confiança: {finding.get('confidence', 0):.0%}
+- Arquivos analisados: {', '.join(finding.get('files_analyzed', [])) or '(nenhum)'}
+
+**Explicação técnica:**
+
+{finding.get('explanation', '')}
+
+**Sugestão de fix (use como guia, não obrigatório literal):**
+
+{suggested}
+
+---
+
+## Sua tarefa
+
+1. Aplique o fix nos arquivos relevantes. Mantenha o escopo MÍNIMO — não
+   refatore coisas não relacionadas. Mude só o necessário.
+2. Se existirem tests cobrindo a área, garanta que continuam passando.
+   Se NÃO existir teste cobrindo o caso específico do bug, adicione um
+   teste mínimo (junto com o fix) que reproduziria o bug e agora passa.
+3. Rode `npm test` (este repo é Node) ou `npm run test` pra confirmar que
+   tudo passa antes de terminar.
+4. NÃO commite — só edite. O workflow que te chamou vai commitar e abrir PR.
+5. Quando terminar, descreva em 2-3 linhas o que fez (texto livre, não
+   precisa de JSON).
+
+Restrição de escopo: limite-se a `{repo}`. Não toque em outros repos.
+"""
+
+
+def _build_commit_message(finding: dict, origin: dict, target: dict) -> str:
+    prefix = "fix" if finding.get("kind") == "bug" else "feat"
+    summary = finding.get("summary", "(sem resumo)")[:72]
+    return (
+        f"{prefix}: {summary}\n\n"
+        f"Auto-fix em resposta à issue técnica #{target.get('number')}.\n"
+        f"Reportado originalmente em {origin.get('html_url', '?')}\n\n"
+        f"Closes #{target.get('number')}"
+    )
+
+
+def _pr_title_prefix(finding: dict) -> str:
+    return "fix:" if finding.get("kind") == "bug" else "feat:"
+
+
+def _build_pr_body(finding: dict, origin: dict, target: dict) -> str:
+    kind_pt = {"bug": "bug", "improvement": "melhoria"}.get(
+        finding.get("kind", ""), "report"
+    )
+    return (
+        f"Auto-{kind_pt}-fix aplicado pelo Claude Code Agent em resposta à "
+        f"issue técnica #{target.get('number')}.\n\n"
+        f"**Reporte original:** {origin.get('html_url', '?')}\n"
+        f"**Confiança da triagem:** {finding.get('confidence', 0):.0%}\n\n"
+        f"## Diagnóstico\n\n"
+        f"{finding.get('explanation', '')}\n\n"
+        f"## Fix sugerido pela triagem\n\n"
+        f"{finding.get('suggested_fix') or '_(sem sugestão específica)_'}\n\n"
+        f"---\n\n"
+        f"Closes #{target.get('number')}.\n\n"
+        f"Auto-merge habilitado pelo `ci.yml`: a PR será mergeada quando "
+        f"`test` + `preview-deploy` + `preview-smoke` passarem."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Processamento de uma issue
 # ---------------------------------------------------------------------------
 
 
 def _is_actionable(finding: dict) -> bool:
-    """True se o finding deve gerar issue técnica num repo de código."""
     kind = finding.get("kind")
     confidence = float(finding.get("confidence") or 0)
     return (
         kind in ("bug", "improvement")
         and finding.get("target_repo")
         and confidence >= UNDEFINED_CONFIDENCE_THRESHOLD
+    )
+
+
+def _is_auto_fix_eligible(finding: dict) -> bool:
+    kind = finding.get("kind")
+    confidence = float(finding.get("confidence") or 0)
+    return (
+        kind in AUTO_FIX_KINDS
+        and finding.get("target_repo")
+        and confidence >= AUTO_FIX_CONFIDENCE_THRESHOLD
     )
 
 
@@ -325,8 +628,8 @@ def process_issue(issue: dict) -> None:
     findings = result.get("findings", [])
     user_reply = result.get("user_reply", "")
 
-    # Cria issues técnicas pra findings actionable (bug/improvement com confiança)
-    target_issues: list[tuple[dict, str]] = []
+    # Cria issue técnica pra cada finding actionable
+    target_issues: list[tuple[dict, dict]] = []  # (finding, target_issue)
     for finding in findings:
         if not _is_actionable(finding):
             continue
@@ -338,7 +641,7 @@ def process_issue(issue: dict) -> None:
                 _build_target_issue_body(issue, finding),
                 labels=KIND_TO_TARGET_LABELS[kind],
             )
-            target_issues.append((finding, target_issue.get("html_url", "?")))
+            target_issues.append((finding, target_issue))
             log.info(
                 "Issue %s criada em %s: %s",
                 kind,
@@ -353,8 +656,28 @@ def process_issue(issue: dict) -> None:
                 e,
             )
 
-    # Posta UM comentário consolidado na issue original
-    comment = _build_origin_comment(findings, user_reply, target_issues)
+    # Auto-fix pra findings elegíveis (confidence >= 0.9)
+    fix_prs: list[tuple[dict, str]] = []  # (finding, pr_url)
+    for finding, target_issue in target_issues:
+        if not _is_auto_fix_eligible(finding):
+            continue
+        log.info(
+            "Auto-fix elegível: %s em %s (conf %.2f)",
+            finding.get("summary"),
+            finding["target_repo"],
+            finding.get("confidence", 0),
+        )
+        try:
+            pr_url = run_auto_fix(finding, issue, target_issue)
+            if pr_url:
+                fix_prs.append((finding, pr_url))
+        except Exception as e:
+            log.exception("Auto-fix falhou: %s", e)
+
+    # Posta comentário consolidado na issue original
+    comment = _build_origin_comment(
+        findings, user_reply, target_issues, fix_prs
+    )
     try:
         comment_on_issue(REPORTS_REPO, number, comment)
     except Exception as e:
@@ -387,7 +710,6 @@ def _aggregate_labels(findings: list[dict], target_issues: list[tuple]) -> list[
 
     actionable_findings = [f for f in findings if _is_actionable(f)]
 
-    # Adiciona labels per-kind das findings com confiança
     for f in findings:
         kind = f.get("kind", "unclear")
         conf = float(f.get("confidence") or 0)
@@ -398,7 +720,6 @@ def _aggregate_labels(findings: list[dict], target_issues: list[tuple]) -> list[
             seen.add(kind_label)
             labels.append(kind_label)
 
-    # Adiciona repo:X único pras actionable
     for f in actionable_findings:
         repo = f.get("target_repo")
         if repo:
@@ -407,8 +728,10 @@ def _aggregate_labels(findings: list[dict], target_issues: list[tuple]) -> list[
                 seen.add(tag)
                 labels.append(tag)
 
-    # Se nenhuma finding teve confiança >= threshold
-    if len(labels) == 1:  # só TRIAGED_LABEL
+    if any(_is_auto_fix_eligible(f) for f in findings):
+        labels.append("auto-fix-eligible")
+
+    if len(labels) == 1:
         labels.append("low-confidence")
 
     return labels
@@ -448,6 +771,7 @@ def _build_origin_comment(
     findings: list[dict],
     user_reply: str,
     target_issues: list[tuple],
+    fix_prs: list[tuple],
 ) -> str:
     actionable = [f for f in findings if _is_actionable(f)]
 
@@ -458,11 +782,9 @@ def _build_origin_comment(
         "unclear": "NÃO CLASSIFICADO",
     }
 
-    # Header
     if not findings:
         header = "**Análise inconclusiva**"
     elif len(actionable) == 0:
-        # Sem actionable — mas pode ter classificação válida (question)
         kinds = sorted({f.get("kind", "unclear") for f in findings})
         if kinds == ["question"]:
             header = "**Classificado como pergunta** (sem código pra ajustar)"
@@ -490,12 +812,27 @@ def _build_origin_comment(
     if target_issues:
         parts.append("")
         if len(target_issues) == 1:
-            parts.append(f"Issue técnica: {target_issues[0][1]}")
+            finding, ti = target_issues[0]
+            parts.append(f"Issue técnica: {ti.get('html_url', '?')}")
         else:
             parts.append("Issues técnicas:")
-            for finding, url in target_issues:
+            for finding, ti in target_issues:
                 kind_label = "bug" if finding["kind"] == "bug" else "melhoria"
-                parts.append(f"- `{finding.get('target_repo', '?')}` ({kind_label}): {url}")
+                parts.append(
+                    f"- `{finding.get('target_repo', '?')}` ({kind_label}): {ti.get('html_url', '?')}"
+                )
+
+    if fix_prs:
+        parts.append("")
+        if len(fix_prs) == 1:
+            parts.append(
+                f"**Auto-fix em andamento:** {fix_prs[0][1]} — "
+                "será mergeada automaticamente quando passar test + preview-smoke."
+            )
+        else:
+            parts.append("**Auto-fixes em andamento:**")
+            for finding, pr_url in fix_prs:
+                parts.append(f"- `{finding.get('target_repo', '?')}`: {pr_url}")
 
     return "\n".join(parts).strip()
 
@@ -506,7 +843,7 @@ def _build_origin_comment(
 
 
 def main() -> None:
-    log.info("=== Triage Pipeline (MCP + kind-aware) ===")
+    log.info("=== Triage Pipeline (MCP + kind-aware + auto-fix) ===")
     log.info("Reports repo: %s", REPORTS_REPO)
     log.info("Repos-alvo: %s", ", ".join(TARGET_REPOS))
 
