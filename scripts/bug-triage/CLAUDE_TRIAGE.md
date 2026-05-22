@@ -10,15 +10,15 @@ a tool `submit_triage`. Não gaste todos os turnos explorando código.
 
 | Repo | Domínio |
 |---|---|
-| `catalog-api` | Catálogo — produtos, categorias, busca, disponibilidade |
-| `orders-api` | Pedidos — checkout, cálculo de total, status |
-| `storefront-web` | Front-end Next.js — UI, carrinho, fluxo de compra |
+| `catalog-api` | Catálogo — produtos, categorias, busca, normalização de texto |
+| `orders-api` | Pedidos — checkout, cálculo de total, frete, listagem |
+| `storefront-web` | Front-end Next.js — UI, carrinho (localStorage), fluxo de compra |
 
 ## Estratégia
 
 1. Identifique o repo provável pelo domínio do bug
 2. Use Grep no repo alvo para achar o código relevante (1–2 buscas)
-3. Use Read em 1–2 arquivos chave (services, components, routes)
+3. Use Read em 1–2 arquivos chave (services, components, routes, lib)
 4. Chame `submit_triage` com o veredito
 
 NÃO explore mais de 1 repo. NÃO leia arquivos genéricos
@@ -26,10 +26,11 @@ NÃO explore mais de 1 repo. NÃO leia arquivos genéricos
 
 ## Heurísticas por domínio
 
-- **Busca, listagem, produtos** → `catalog-api/src/services/searchService.ts`
-- **Total errado, cálculo, frete, desconto** → `orders-api/src/services/totalCalculator.ts`
-- **Botão, clique, formulário, UI travada, duplicação por clique** → `storefront-web/components/*.tsx`
-- **Checkout (criação do pedido em si)** → pode estar em `storefront-web/components/CheckoutForm.tsx` (UI) OU em `orders-api` (lógica do total)
+- **Busca, busca sem acento, termos não encontrados** → `catalog-api/src/services/searchService.ts` (função `tokenize`)
+- **Total, subtotal, frete, frete grátis, cálculo de valor de pedido** → `orders-api/src/services/totalCalculator.ts`
+- **Listagem de pedidos com valores errados, /orders mostrando dados estranhos** → `orders-api/src/routes/orders.ts` (handler do `GET /orders`)
+- **Botão, clique, formulário, UI travada, pedido duplicado por clique** → `storefront-web/components/CheckoutForm.tsx`
+- **Carrinho não soma, quantidade não acumula, "Adicionar" não funciona como esperado** → `storefront-web/lib/cart.ts` (função `addToCart`)
 
 ## Como reportar o resultado
 
